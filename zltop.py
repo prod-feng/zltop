@@ -4,7 +4,7 @@ This purpose of this program is to provide a lighed weighted tool to monitor the
 It only uses ssh, lctl command, python's curses, multiprocess modules.
 Lustre seems has very rough manual for it's procfs system, many of them are not clear what they really are. We can still get 
 some useful performance metrics from it.
-Ss
+
 This program does not support multiple OSTs on an OSS, or multiple MDTs either. Some of the performance metrics are missing, which need more works.
 
 
@@ -171,6 +171,9 @@ def show(w):
 
     w.refresh()
 
+#   update the old params
+    for (key, value) in mdtdata.items():
+       mdtdata_prev[key] =mdtdata[key]
     for (key, value) in mydata.items():
        mydata_prev[key] =mydata[key]
     for (key, value) in myrates.items():
