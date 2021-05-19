@@ -26,8 +26,8 @@ debug=1
 # Make sure these servers can be ssh accessed via key(not password).
 # No need to be root to run this program.
 #
-ost_hosts=['titanm3', 'titanm4']
-mdt_hosts= ['titanm1']
+ost_hosts=['oss1', 'oss2']
+mdt_hosts= ['mds1']
 # Define the MDT and OST info we need.
 ost_param=['obdfilter.*-OST*.kbyte*', 'obdfilter.*-OST*.file*', 'obdfilter.*-OST*.stats']
 mdt_param=['osd*.*MDT*.kbyte*', 'osd*.*MDT*.files*', 'mdt.*MDT*.md_stats']
@@ -57,7 +57,7 @@ import threading
 
 def plot_sum(w,ftot,nfus,fuse,ffre,stot,nsus,suse,sfre):
 
-#    threading.Thread(target=keypress).start()
+#   
  
     # plot the sumarry info of the storage
     w.addstr(0, 0, "Storage system status:")
