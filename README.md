@@ -8,3 +8,6 @@ This program does not support multiple OSTs on an OSS, or multiple MDTs either. 
 
 
 Nothing is guaranteed here. Use at your own risk.
+
+
+Python 2.7, Centos 7, Lustre 2.12.5.
