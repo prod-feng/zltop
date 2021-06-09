@@ -99,10 +99,10 @@ def show(w):
  
     myratesum={}
     mdtrates={}
-    mdtval={} #list to store the iops info from MDT, easy to handle in coding
+    #mdtval={} #list to store the iops info from MDT, easy to handle in coding
     for host in mdt_hosts:
         mdtrates[host]= dict(zip(mdt_dataps,mdt_dataps_init))
-    mdtval={}
+    mdtval=dict(zip(mdt_dataps,mdt_dataps_init)) # set initilization value, in case some key/value missing, like after reboot.
         
     for host in mdt_hosts:
         mdtrates[host].pop('snapshot_time')
@@ -112,6 +112,7 @@ def show(w):
     for host in mdt_hosts:
        iops[host]=0
        for (mdata, value) in mdtrates[host].items():
+         if mdata in mdtdata.keys():
            tdif =float(mdtdata[host]['snapshot_time']) - float(mdtdata_prev[host]['snapshot_time'])
            if (tdif <= 0):
                tdif = 1
@@ -124,10 +125,11 @@ def show(w):
     iops_sum = int(iops_sum +0.5)
 
     for (mdata, value) in mdtrates[host].items():
-      mdtval[mdata] = 0
-      for host in mdt_hosts:
-         mdtval[mdata] = mdtval[mdata] + mdtrates[host][mdata]
-      mdtval[mdata] = int( mdtval[mdata] +0.5)
+      if mdata in mdtdata.keys():
+        mdtval[mdata] = 0
+        for host in mdt_hosts:
+           mdtval[mdata] = mdtval[mdata] + mdtrates[host][mdata]
+        mdtval[mdata] = int( mdtval[mdata] +0.5)
 
 
     for host in ost_hosts:
