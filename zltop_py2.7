@@ -1440,7 +1440,7 @@ def draw_operation_grid(
         x = column * column_width
 
         text = (
-            '%-12s %10s'
+            '%-15s %10s'
             % (
                 operation,
                 format_rate(
@@ -2218,7 +2218,7 @@ def draw_screen(
         'MDT DETAILED OPERATIONS / SEC',
         MDT_OPERATIONS,
         monitor.mdt_operation_totals(),
-        25
+        28
     )
 
     if row >= height - 2:
