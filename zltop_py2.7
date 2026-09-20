@@ -1,0 +1,3107 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+
+"""
+Lustre Storage Performance Monitor
+==================================
+
+Python 2.7 compatible.
+
+The collection and rate-calculation algorithm is intentionally based on
+Lustre cumulative counters and snapshot_time.
+
+Keys:
+
+    q       Quit
+    r       Refresh immediately
+
+Examples:
+
+    python2.7 lustre_monitor.py
+
+    python2.7 lustre_monitor.py \
+        --oss ookami04 \
+        --oss ookami05 \
+        --mds ookami02
+
+    python2.7 lustre_monitor.py --once
+
+    python2.7 lustre_monitor.py \
+        --oss ookami04 \
+        --mds ookami02 \
+        --once
+
+
+This program collects Lustre performance information using:
+
+    ssh
+    /usr/sbin/lctl get_param
+
+It is designed around Lustre output such as:
+
+OSS:
+
+obdfilter.cls04010-OST0000.kbytesavail=116865851864
+obdfilter.cls04010-OST0000.kbytesfree=120802806588
+obdfilter.cls04010-OST0000.kbytestotal=390365606128
+
+obdfilter.cls04010-OST0000.filesfree=298919263
+obdfilter.cls04010-OST0000.filestotal=384429952
+
+obdfilter.cls04010-OST0000.stats=
+snapshot_time             1789936196.719749479 secs.nsecs
+read_bytes                2741015563 samples [bytes] 1 4194304 2212208235646983
+write_bytes               865416709 samples [bytes] 1 4194304 1956767105813338
+getattr                   641716717 samples [reqs]
+setattr                   987954196 samples [reqs]
+punch                     24337679 samples [reqs]
+sync                      331147012 samples [reqs]
+destroy                   368805874 samples [reqs]
+create                    78604 samples [reqs]
+statfs                    1859226 samples [reqs]
+get_info                  3 samples [reqs]
+set_info                  14394 samples [reqs]
+quotactl                  18254 samples [reqs]
+
+MDT:
+
+osd-ldiskfs.cls04010-MDT0000.kbytesavail=3910410976
+osd-ldiskfs.cls04010-MDT0000.kbytesfree=3995811364
+osd-ldiskfs.cls04010-MDT0000.kbytestotal=4231249880
+
+osd-ldiskfs.cls04010-MDT0000.filesfree=4028998808
+osd-ldiskfs.cls04010-MDT0000.filestotal=4270030848
+
+mdt.cls04010-MDT0000.md_stats=
+snapshot_time             1789936384.884839506 secs.nsecs
+open                      6342332055 samples [reqs] 1 1 6342332055
+close                     5592079279 samples [reqs] 1 1 5592079279
+mknod                     743404900 samples [reqs]
+link                      7170912 samples [reqs]
+unlink                    132112140 samples [reqs]
+mkdir                     12904897 samples [reqs]
+rmdir                     7378217 samples [reqs]
+rename                    20683631 samples [reqs]
+getattr                   9450681049 samples [reqs]
+setattr                   1518871255 samples [reqs]
+getxattr                  818091495 samples [reqs]
+setxattr                  358381 samples [reqs]
+statfs                    3301329 samples [reqs]
+sync                      667112089 samples [reqs]
+samedir_rename            17838741 samples [reqs]
+crossdir_rename           2844890 samples [reqs]
+"""
+
+import argparse
+import curses
+import re
+import subprocess
+import sys
+import threading
+import time
+
+
+# ============================================================================
+# COMPATIBILITY
+# ============================================================================
+
+try:
+    monotonic = time.monotonic
+except AttributeError:
+    monotonic = time.time
+
+
+# ============================================================================
+# DEFAULT CONFIGURATION
+# ============================================================================
+
+DEFAULT_OSS_HOSTS = [
+    'ookami04',
+    'ookami05',
+    'ookami06',
+    'ookami07',
+]
+
+DEFAULT_MDS_HOSTS = [
+    'ookami02',
+    'ookami03'
+]
+
+DEFAULT_INTERVAL = 3.0
+DEFAULT_SSH_TIMEOUT = 15.0
+
+
+# ============================================================================
+# LUSTRE PARAMETER PATTERNS
+# ============================================================================
+
+OSS_CAPACITY_PARAMS = [
+    'obdfilter.*-OST*.kbyte*',
+]
+
+OSS_FILE_PARAMS = [
+    'obdfilter.*-OST*.file*',
+]
+
+OSS_STATS_PARAMS = [
+    'obdfilter.*-OST*.stats*',
+]
+
+MDT_CAPACITY_PARAMS = [
+    'osd*.*MDT*.kbyte*',
+]
+
+MDT_FILE_PARAMS = [
+    'osd*.*MDT*.files*',
+]
+
+MDT_STATS_PARAMS = [
+    'mdt.*MDT*.md_stats',
+]
+
+
+# ============================================================================
+# OPERATION DEFINITIONS
+# ============================================================================
+
+OSS_OPERATIONS = [
+    'getattr',
+    'setattr',
+    'punch',
+    'sync',
+    'destroy',
+    'create',
+    'statfs',
+    'get_info',
+    'set_info',
+    'quotactl',
+]
+
+MDT_OPERATIONS = [
+    'open',
+    'close',
+    'mknod',
+    'link',
+    'unlink',
+    'mkdir',
+    'rmdir',
+    'rename',
+    'getattr',
+    'setattr',
+    'getxattr',
+    'setxattr',
+    'statfs',
+    'sync',
+    'samedir_rename',
+    'crossdir_rename',
+]
+
+
+# ============================================================================
+# DATA CLASSES
+# ============================================================================
+
+class Target(object):
+
+    def __init__(self, name):
+
+        self.name = name
+
+        self.metrics = {}
+
+        self.previous_metrics = {}
+
+        self.rates = {}
+
+        self.timestamp = 0.0
+
+        self.previous_timestamp = 0.0
+
+        self.success = False
+
+        self.error = ''
+
+
+class CollectionResult(object):
+
+    def __init__(
+            self,
+            host,
+            role,
+            output='',
+            error='',
+            returncode=0):
+
+        self.host = host
+        self.role = role
+        self.output = output
+        self.error = error
+        self.returncode = returncode
+
+        self.success = (
+            returncode == 0 and
+            not error
+        )
+
+
+# ============================================================================
+# GENERAL UTILITIES
+# ============================================================================
+
+def safe_float(value, default=0.0):
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_int(value, default=0):
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def counter_rate(current, previous, elapsed):
+
+    if elapsed <= 0:
+        return 0.0
+
+    if current < previous:
+        # Counter was reset, probably because of restart/reboot.
+        return 0.0
+
+    return (
+        current - previous
+    ) / elapsed
+
+
+def mib(value):
+
+    return value / (
+        1024.0 * 1024.0
+    )
+
+
+def gib(value):
+
+    return value / (
+        1024.0 *
+        1024.0 *
+        1024.0
+    )
+
+
+def tib(value):
+
+    return value / (
+        1024.0 *
+        1024.0 *
+        1024.0 *
+        1024.0
+    )
+
+
+def percent(used, total):
+
+    if total <= 0:
+        return 0.0
+
+    return (
+        100.0 *
+        used /
+        total
+    )
+
+
+def clamp(value, low, high):
+
+    if value < low:
+        return low
+
+    if value > high:
+        return high
+
+    return value
+
+
+def format_number(value):
+
+    if abs(value) >= 1000000:
+        return '%.1fM' % (
+            value / 1000000.0
+        )
+
+    if abs(value) >= 1000:
+        return '%.1fK' % (
+            value / 1000.0
+        )
+
+    return '%.1f' % value
+
+
+def format_rate(value):
+
+    if abs(value) >= 1000000:
+        return '%.1fM' % (
+            value / 1000000.0
+        )
+
+    if abs(value) >= 1000:
+        return '%.1fK' % (
+            value / 1000.0
+        )
+
+    return '%.1f' % value
+
+
+def format_mib_rate(value):
+
+    return '%.2f' % mib(value)
+
+
+# ============================================================================
+# PARSING HELPERS
+# ============================================================================
+
+def parse_key_value_line(line):
+
+    if '=' not in line:
+        return None, None
+
+    key, value = line.split(
+        '=',
+        1
+    )
+
+    return (
+        key.strip(),
+        value.strip()
+    )
+
+
+def get_lustre_target_name(parameter):
+
+    parameter = parameter.strip()
+
+    parts = parameter.split('.')
+
+    if len(parts) < 2:
+        return parameter
+
+    target = parts[1]
+
+    return target
+
+
+def get_parameter_name(parameter):
+
+    parts = parameter.strip().split('.')
+
+    if not parts:
+        return ''
+
+    return parts[-1]
+
+
+def parse_capacity_output(output):
+
+    result = {}
+
+    for line in output.splitlines():
+
+        line = line.strip()
+
+        if not line:
+            continue
+
+        key, value = parse_key_value_line(
+            line
+        )
+
+        if key is None:
+            continue
+
+        target = get_lustre_target_name(
+            key
+        )
+
+        parameter = get_parameter_name(
+            key
+        )
+
+        if not target:
+            continue
+
+        if not parameter:
+            continue
+
+        if target not in result:
+            result[target] = {}
+
+        result[target][parameter] = safe_float(
+            value
+        )
+
+    return result
+
+
+def parse_stats_counter_line(line):
+
+    fields = line.strip().split()
+
+    if len(fields) < 2:
+        return None, None
+
+    operation = fields[0]
+
+    if operation == 'snapshot_time':
+
+        if len(fields) >= 2:
+
+            timestamp = safe_float(
+                fields[1],
+                None
+            )
+
+            return (
+                'snapshot_time',
+                timestamp
+            )
+
+        return (
+            'snapshot_time',
+            None
+        )
+
+    if 'samples' not in fields:
+
+        return None, None
+
+    samples_index = fields.index(
+        'samples'
+    )
+
+    numeric_values = []
+
+    for value in fields[1:]:
+
+        if value == 'samples':
+            break
+
+        try:
+            numeric_values.append(
+                float(value)
+            )
+        except ValueError:
+            pass
+
+    # Bytes statistics.
+    if (
+            samples_index + 1 < len(fields) and
+            fields[samples_index + 1] == '[bytes]'):
+
+        values_after_units = []
+
+        for value in fields[
+                samples_index + 2:]:
+            try:
+                values_after_units.append(
+                    float(value)
+                )
+            except ValueError:
+                pass
+
+        if values_after_units:
+
+            return (
+                operation,
+                values_after_units[-1]
+            )
+
+        if numeric_values:
+
+            return (
+                operation,
+                numeric_values[0]
+            )
+
+        return (
+            operation,
+            None
+        )
+
+    # Request statistics.
+    if (
+            samples_index + 1 < len(fields) and
+            fields[samples_index + 1] == '[reqs]'):
+
+        values_after_units = []
+
+        for value in fields[
+                samples_index + 2:]:
+            try:
+                values_after_units.append(
+                    float(value)
+                )
+            except ValueError:
+                pass
+
+        if values_after_units:
+
+            return (
+                operation,
+                values_after_units[-1]
+            )
+
+        if numeric_values:
+
+            return (
+                operation,
+                numeric_values[0]
+            )
+
+        return (
+            operation,
+            None
+        )
+
+    # Generic fallback.
+    if numeric_values:
+
+        return (
+            operation,
+            numeric_values[-1]
+        )
+
+    return (
+        operation,
+        None
+    )
+
+
+def parse_stats_output(output):
+
+    result = {}
+
+    for line in output.splitlines():
+
+        line = line.strip()
+
+        if not line:
+            continue
+
+        if line.endswith('='):
+            continue
+
+        key, value = parse_stats_counter_line(
+            line
+        )
+
+        if key is None:
+            continue
+
+        if value is None:
+            continue
+
+        result[key] = value
+
+    return result
+
+
+# ============================================================================
+# SSH
+# ============================================================================
+
+def run_ssh_lctl(
+        host,
+        params,
+        timeout):
+
+    command = [
+        'ssh',
+        '-o',
+        'BatchMode=yes',
+        '-o',
+        'ConnectTimeout=%d' % int(timeout),
+        host,
+        '/usr/sbin/lctl',
+        'get_param'
+    ]
+
+    command.extend(params)
+
+    try:
+
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+    except OSError as exc:
+
+        return CollectionResult(
+            host,
+            '',
+            '',
+            str(exc),
+            1
+        )
+
+    try:
+
+        stdout_data, stderr_data = (
+            process.communicate()
+        )
+
+    except Exception as exc:
+
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+        return CollectionResult(
+            host,
+            '',
+            '',
+            str(exc),
+            1
+        )
+
+    if process.returncode != 0:
+
+        error = stderr_data.strip()
+
+        if not error:
+            error = (
+                'ssh/lctl returned '
+                'status %d'
+                % process.returncode
+            )
+
+        return CollectionResult(
+            host,
+            '',
+            stdout_data,
+            error,
+            process.returncode
+        )
+
+    return CollectionResult(
+        host,
+        '',
+        stdout_data,
+        '',
+        0
+    )
+
+
+# ============================================================================
+# PARALLEL SSH COLLECTION
+# ============================================================================
+
+def collect_host(
+        host,
+        role,
+        parameter_groups,
+        timeout):
+
+    all_output = []
+
+    errors = []
+
+    for params in parameter_groups:
+
+        result = run_ssh_lctl(
+            host,
+            params,
+            timeout
+        )
+
+        if not result.success:
+
+            errors.append(
+                result.error
+            )
+
+            continue
+
+        all_output.append(
+            result.output
+        )
+
+    if errors:
+
+        return CollectionResult(
+            host,
+            role,
+            '\n'.join(all_output),
+            '; '.join(errors),
+            1
+        )
+
+    return CollectionResult(
+        host,
+        role,
+        '\n'.join(all_output),
+        '',
+        0
+    )
+
+
+def parallel_collect(
+        hosts,
+        role,
+        parameter_groups,
+        timeout):
+
+    results = {}
+
+    threads = []
+
+    lock = threading.Lock()
+
+    def worker(host):
+
+        result = collect_host(
+            host,
+            role,
+            parameter_groups,
+            timeout
+        )
+
+        lock.acquire()
+
+        try:
+            results[host] = result
+        finally:
+            lock.release()
+
+    for host in hosts:
+
+        thread = threading.Thread(
+            target=worker,
+            args=(host,)
+        )
+
+        thread.daemon = True
+
+        thread.start()
+
+        threads.append(thread)
+
+    for thread in threads:
+
+        thread.join(
+            timeout + 30
+        )
+
+    for host in hosts:
+
+        if host not in results:
+
+            results[host] = CollectionResult(
+                host,
+                role,
+                '',
+                'collection timeout',
+                1
+            )
+
+    return results
+
+
+# ============================================================================
+# TARGET METRIC STORAGE
+# ============================================================================
+
+class TargetStore(object):
+
+    def __init__(self):
+
+        self.targets = {}
+
+    def get(self, name):
+
+        if name not in self.targets:
+
+            self.targets[name] = Target(
+                name
+            )
+
+        return self.targets[name]
+
+    def update(
+            self,
+            name,
+            metrics,
+            timestamp,
+            success=True,
+            error=''):
+
+        target = self.get(
+            name
+        )
+
+        if target.success:
+
+            target.previous_metrics = dict(
+                target.metrics
+            )
+
+            target.previous_timestamp = (
+                target.timestamp
+            )
+
+        else:
+
+            target.previous_metrics = {}
+
+            target.previous_timestamp = 0.0
+
+        target.metrics = dict(
+            metrics
+        )
+
+        target.timestamp = timestamp
+
+        target.success = success
+
+        target.error = error
+
+        target.rates = {}
+
+        if not success:
+            return
+
+        if not target.previous_metrics:
+            return
+
+        elapsed = (
+            target.timestamp -
+            target.previous_timestamp
+        )
+
+        if elapsed <= 0:
+            return
+
+        for key in target.metrics:
+
+            if key not in target.previous_metrics:
+                continue
+
+            current = target.metrics[key]
+
+            previous = target.previous_metrics[key]
+
+            target.rates[key] = counter_rate(
+                current,
+                previous,
+                elapsed
+            )
+
+    def values(self):
+
+        return self.targets.values()
+
+
+# ============================================================================
+# MULTI-TARGET STATS PARSER
+# ============================================================================
+
+def parse_stats_by_target(
+        output,
+        target_type):
+
+    result = {}
+
+    current_target = None
+
+    current_lines = []
+
+    for raw_line in output.splitlines():
+
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        if '=' in line:
+
+            left, right = (
+                line.split('=', 1)
+            )
+
+            left = left.strip()
+
+            lower_left = left.lower()
+
+            is_oss_stats = (
+                '.stats' in lower_left
+            )
+
+            is_mdt_stats = (
+                '.md_stats' in lower_left
+            )
+
+            if (
+                    (target_type == 'OST' and
+                     is_oss_stats) or
+                    (target_type == 'MDT' and
+                     is_mdt_stats)):
+
+                if (
+                        current_target is not None and
+                        current_lines):
+
+                    result[
+                        current_target
+                    ] = parse_stats_output(
+                        '\n'.join(
+                            current_lines
+                        )
+                    )
+
+                current_target = (
+                    get_lustre_target_name(
+                        left
+                    )
+                )
+
+                current_lines = []
+
+                continue
+
+        if current_target is not None:
+
+            current_lines.append(
+                line
+            )
+
+    if (
+            current_target is not None and
+            current_lines):
+
+        result[
+            current_target
+        ] = parse_stats_output(
+            '\n'.join(
+                current_lines
+            )
+        )
+
+    return result
+
+
+# ============================================================================
+# MONITOR
+# ============================================================================
+
+class LustreMonitor(object):
+
+    def __init__(
+            self,
+            oss_hosts,
+            mds_hosts,
+            interval=3.0,
+            ssh_timeout=15.0):
+
+        self.oss_hosts = list(
+            oss_hosts
+        )
+
+        self.mds_hosts = list(
+            mds_hosts
+        )
+
+        self.interval = interval
+
+        self.ssh_timeout = ssh_timeout
+
+        self.oss = TargetStore()
+
+        self.mdt = TargetStore()
+
+        self.last_collection = 0.0
+
+        self.oss_errors = {}
+
+        self.mds_errors = {}
+
+    # ------------------------------------------------------------------------
+    # COLLECT OSS
+    # ------------------------------------------------------------------------
+
+    def collect_oss(self):
+
+        parameter_groups = [
+            OSS_CAPACITY_PARAMS,
+            OSS_FILE_PARAMS,
+            OSS_STATS_PARAMS,
+        ]
+
+        results = parallel_collect(
+            self.oss_hosts,
+            'OSS',
+            parameter_groups,
+            self.ssh_timeout
+        )
+
+        self.oss_errors = {}
+
+        for host in self.oss_hosts:
+
+            result = results[host]
+
+            if not result.success:
+
+                self.oss_errors[host] = (
+                    result.error
+                )
+
+                continue
+
+            capacity = parse_capacity_output(
+                result.output
+            )
+
+            stats_by_target = (
+                parse_stats_by_target(
+                    result.output,
+                    'OST'
+                )
+            )
+
+            target_names = set()
+
+            for name in capacity:
+                target_names.add(name)
+
+            for name in stats_by_target:
+                target_names.add(name)
+
+            for target_name in target_names:
+
+                metrics = {}
+
+                if target_name in capacity:
+
+                    metrics.update(
+                        capacity[target_name]
+                    )
+
+                if target_name in stats_by_target:
+
+                    metrics.update(
+                        stats_by_target[
+                            target_name
+                        ]
+                    )
+
+                timestamp = metrics.get(
+                    'snapshot_time',
+                    time.time()
+                )
+
+                self.oss.update(
+                    target_name,
+                    metrics,
+                    timestamp,
+                    True,
+                    ''
+                )
+
+    # ------------------------------------------------------------------------
+    # COLLECT MDT
+    # ------------------------------------------------------------------------
+
+    def collect_mdt(self):
+
+        parameter_groups = [
+            MDT_CAPACITY_PARAMS,
+            MDT_FILE_PARAMS,
+            MDT_STATS_PARAMS,
+        ]
+
+        results = parallel_collect(
+            self.mds_hosts,
+            'MDS',
+            parameter_groups,
+            self.ssh_timeout
+        )
+
+        self.mds_errors = {}
+
+        for host in self.mds_hosts:
+
+            result = results[host]
+
+            if not result.success:
+
+                self.mds_errors[host] = (
+                    result.error
+                )
+
+                continue
+
+            capacity = parse_capacity_output(
+                result.output
+            )
+
+            stats_by_target = (
+                parse_stats_by_target(
+                    result.output,
+                    'MDT'
+                )
+            )
+
+            target_names = set()
+
+            for name in capacity:
+                target_names.add(name)
+
+            for name in stats_by_target:
+                target_names.add(name)
+
+            for target_name in target_names:
+
+                metrics = {}
+
+                if target_name in capacity:
+
+                    metrics.update(
+                        capacity[target_name]
+                    )
+
+                if target_name in stats_by_target:
+
+                    metrics.update(
+                        stats_by_target[
+                            target_name
+                        ]
+                    )
+
+                timestamp = metrics.get(
+                    'snapshot_time',
+                    time.time()
+                )
+
+                self.mdt.update(
+                    target_name,
+                    metrics,
+                    timestamp,
+                    True,
+                    ''
+                )
+
+    # ------------------------------------------------------------------------
+    # COLLECT EVERYTHING
+    # ------------------------------------------------------------------------
+
+    def collect(self):
+
+        self.collect_oss()
+
+        self.collect_mdt()
+
+        self.last_collection = monotonic()
+
+    # ------------------------------------------------------------------------
+    # OSS TOTALS
+    # ------------------------------------------------------------------------
+
+    def oss_totals(self):
+
+        result = {
+            'kbytesavail': 0.0,
+            'kbytesfree': 0.0,
+            'kbytestotal': 0.0,
+            'filesfree': 0.0,
+            'filestotal': 0.0,
+            'read_bytes_rate': 0.0,
+            'write_bytes_rate': 0.0,
+        }
+
+        for target in self.oss.values():
+
+            if not target.success:
+                continue
+
+            result['kbytesavail'] += (
+                target.metrics.get(
+                    'kbytesavail',
+                    0.0
+                )
+            )
+
+            result['kbytesfree'] += (
+                target.metrics.get(
+                    'kbytesfree',
+                    0.0
+                )
+            )
+
+            result['kbytestotal'] += (
+                target.metrics.get(
+                    'kbytestotal',
+                    0.0
+                )
+            )
+
+            result['filesfree'] += (
+                target.metrics.get(
+                    'filesfree',
+                    0.0
+                )
+            )
+
+            result['filestotal'] += (
+                target.metrics.get(
+                    'filestotal',
+                    0.0
+                )
+            )
+
+            result['read_bytes_rate'] += (
+                target.rates.get(
+                    'read_bytes',
+                    0.0
+                )
+            )
+
+            result['write_bytes_rate'] += (
+                target.rates.get(
+                    'write_bytes',
+                    0.0
+                )
+            )
+
+        return result
+
+    # ------------------------------------------------------------------------
+    # MDT TOTALS
+    # ------------------------------------------------------------------------
+
+    def mdt_operation_totals(self):
+
+        result = {}
+
+        for operation in MDT_OPERATIONS:
+
+            result[operation] = 0.0
+
+        for target in self.mdt.values():
+
+            if not target.success:
+                continue
+
+            for operation in MDT_OPERATIONS:
+
+                result[operation] += (
+                    target.rates.get(
+                        operation,
+                        0.0
+                    )
+                )
+
+        return result
+
+    # ------------------------------------------------------------------------
+    # OSS OPERATION TOTALS
+    # ------------------------------------------------------------------------
+
+    def oss_operation_totals(self):
+
+        result = {}
+
+        for operation in OSS_OPERATIONS:
+
+            result[operation] = 0.0
+
+        for target in self.oss.values():
+
+            if not target.success:
+                continue
+
+            for operation in OSS_OPERATIONS:
+
+                result[operation] += (
+                    target.rates.get(
+                        operation,
+                        0.0
+                    )
+                )
+
+        return result
+
+
+# ============================================================================
+# CURSES HELPERS
+# ============================================================================
+
+def safe_addstr(
+        window,
+        row,
+        column,
+        text,
+        attribute=0):
+
+    try:
+
+        height, width = (
+            window.getmaxyx()
+        )
+
+        if row < 0:
+            return
+
+        if row >= height:
+            return
+
+        if column < 0:
+            return
+
+        if column >= width:
+            return
+
+        available = (
+            width -
+            column -
+            1
+        )
+
+        if available <= 0:
+            return
+
+        window.addstr(
+            row,
+            column,
+            str(text)[:available],
+            attribute
+        )
+
+    except curses.error:
+
+        pass
+
+
+def clear_window(window):
+
+    try:
+        window.erase()
+    except curses.error:
+        pass
+
+
+# ============================================================================
+# DRAW COMPACT 4-COLUMN OPERATIONS
+# ============================================================================
+
+def draw_operation_grid(
+        window,
+        row,
+        title,
+        operations,
+        totals,
+        column_width=25):
+
+    safe_addstr(
+        window,
+        row,
+        0,
+        title,
+        curses.A_BOLD
+    )
+
+    row += 1
+
+    width = window.getmaxyx()[1]
+
+    columns = max(
+        1,
+        min(
+            4,
+            width // column_width
+        )
+    )
+
+    for index, operation in enumerate(
+            operations):
+
+        column = index % columns
+
+        if column == 0 and index > 0:
+            row += 1
+
+        x = column * column_width
+
+        text = (
+            '%-12s %10s'
+            % (
+                operation,
+                format_rate(
+                    totals.get(
+                        operation,
+                        0.0
+                    )
+                )
+            )
+        )
+
+        safe_addstr(
+            window,
+            row,
+            x,
+            text
+        )
+
+    rows = (
+        (len(operations) + columns - 1)
+        // columns
+    )
+
+    return row + rows + 1
+
+
+# ============================================================================
+# DRAW OSS I/O
+# ============================================================================
+
+def draw_oss_io(
+        window,
+        monitor,
+        row):
+
+    safe_addstr(
+        window,
+        row,
+        0,
+        'OSS I/O',
+        curses.A_BOLD
+    )
+
+    row += 1
+
+    header = (
+        '%-28s '
+        '%14s '
+        '%14s '
+        '%12s '
+        '%12s'
+        % (
+            'OST',
+            'Read MiB/s',
+            'Write MiB/s',
+            'getattr/s',
+            'setattr/s'
+        )
+    )
+
+    safe_addstr(
+        window,
+        row,
+        0,
+        header
+    )
+
+    row += 1
+
+    for name in sorted(
+            monitor.oss.targets.keys()):
+
+        target = (
+            monitor.oss.targets[name]
+        )
+
+        if not target.success:
+            continue
+
+        read_rate = target.rates.get(
+            'read_bytes',
+            0.0
+        )
+
+        write_rate = target.rates.get(
+            'write_bytes',
+            0.0
+        )
+
+        getattr_rate = target.rates.get(
+            'getattr',
+            0.0
+        )
+
+        setattr_rate = target.rates.get(
+            'setattr',
+            0.0
+        )
+
+        text = (
+            '%-28s '
+            '%14.2f '
+            '%14.2f '
+            '%12s '
+            '%12s'
+            % (
+                name,
+                mib(read_rate),
+                mib(write_rate),
+                format_rate(
+                    getattr_rate
+                ),
+                format_rate(
+                    setattr_rate
+                )
+            )
+        )
+
+        safe_addstr(
+            window,
+            row,
+            0,
+            text
+        )
+
+        row += 1
+
+    totals = monitor.oss_totals()
+
+    text = (
+        '%-28s '
+        '%14.2f '
+        '%14.2f '
+        '%12s '
+        '%12s'
+        % (
+            'TOTAL',
+            mib(
+                totals[
+                    'read_bytes_rate'
+                ]
+            ),
+            mib(
+                totals[
+                    'write_bytes_rate'
+                ]
+            ),
+            format_rate(
+                monitor.oss_operation_totals().get(
+                    'getattr',
+                    0.0
+                )
+            ),
+            format_rate(
+                monitor.oss_operation_totals().get(
+                    'setattr',
+                    0.0
+                )
+            )
+        )
+    )
+
+    safe_addstr(
+        window,
+        row,
+        0,
+        text,
+        curses.A_BOLD
+    )
+
+    return row + 2
+
+
+# ============================================================================
+# DRAW MDT PRIMARY OPERATIONS
+# ============================================================================
+
+def draw_mdt(
+        window,
+        monitor,
+        row):
+
+    safe_addstr(
+        window,
+        row,
+        0,
+        'MDT OPERATIONS / SEC',
+        curses.A_BOLD
+    )
+
+    row += 1
+
+    header = (
+        '%-28s '
+        '%12s '
+        '%12s '
+        '%12s '
+        '%12s'
+        % (
+            'MDT',
+            'open/s',
+            'close/s',
+            'getattr/s',
+            'setattr/s'
+        )
+    )
+
+    safe_addstr(
+        window,
+        row,
+        0,
+        header
+    )
+
+    row += 1
+
+    for name in sorted(
+            monitor.mdt.targets.keys()):
+
+        target = (
+            monitor.mdt.targets[name]
+        )
+
+        if not target.success:
+            continue
+
+        text = (
+            '%-28s '
+            '%12s '
+            '%12s '
+            '%12s '
+            '%12s'
+            % (
+                name,
+                format_rate(
+                    target.rates.get(
+                        'open',
+                        0.0
+                    )
+                ),
+                format_rate(
+                    target.rates.get(
+                        'close',
+                        0.0
+                    )
+                ),
+                format_rate(
+                    target.rates.get(
+                        'getattr',
+                        0.0
+                    )
+                ),
+                format_rate(
+                    target.rates.get(
+                        'setattr',
+                        0.0
+                    )
+                )
+            )
+        )
+
+        safe_addstr(
+            window,
+            row,
+            0,
+            text
+        )
+
+        row += 1
+
+    totals = monitor.mdt_operation_totals()
+
+    text = (
+        '%-28s '
+        '%12s '
+        '%12s '
+        '%12s '
+        '%12s'
+        % (
+            'TOTAL',
+            format_rate(
+                totals['open']
+            ),
+            format_rate(
+                totals['close']
+            ),
+            format_rate(
+                totals['getattr']
+            ),
+            format_rate(
+                totals['setattr']
+            )
+        )
+    )
+
+    safe_addstr(
+        window,
+        row,
+        0,
+        text,
+        curses.A_BOLD
+    )
+
+    return row + 2
+
+
+# ============================================================================
+# DRAW STATUS
+# ============================================================================
+
+def draw_status(
+        window,
+        monitor,
+        row):
+
+    safe_addstr(
+        window,
+        row,
+        0,
+        'STATUS',
+        curses.A_BOLD
+    )
+
+    row += 1
+
+    oss_ok = []
+    oss_bad = []
+
+    for host in monitor.oss_hosts:
+
+        if host in monitor.oss_errors:
+            oss_bad.append(
+                '%s:%s' % (
+                    host,
+                    monitor.oss_errors[host]
+                )
+            )
+        else:
+            oss_ok.append(host)
+
+    mds_ok = []
+    mds_bad = []
+
+    for host in monitor.mds_hosts:
+
+        if host in monitor.mds_errors:
+            mds_bad.append(
+                '%s:%s' % (
+                    host,
+                    monitor.mds_errors[host]
+                )
+            )
+        else:
+            mds_ok.append(host)
+
+    if oss_bad:
+
+        oss_text = (
+            'OSS OK[%s] ERROR[%s]'
+            % (
+                ','.join(oss_ok),
+                ','.join(oss_bad)
+            )
+        )
+
+    else:
+
+        oss_text = (
+            'OSS OK[%s]'
+            % ','.join(oss_ok)
+        )
+
+    if mds_bad:
+
+        mds_text = (
+            'MDS OK[%s] ERROR[%s]'
+            % (
+                ','.join(mds_ok),
+                ','.join(mds_bad)
+            )
+        )
+
+    else:
+
+        mds_text = (
+            'MDS OK[%s]'
+            % ','.join(mds_ok)
+        )
+
+    safe_addstr(
+        window,
+        row,
+        0,
+        oss_text
+    )
+
+    row += 1
+
+    safe_addstr(
+        window,
+        row,
+        0,
+        mds_text
+    )
+
+    return row + 1
+
+
+# ============================================================================
+# DRAW OST CAPACITY
+# ============================================================================
+
+def draw_capacity(
+        window,
+        monitor,
+        row):
+
+    safe_addstr(
+        window,
+        row,
+        0,
+        'OST CAPACITY',
+        curses.A_BOLD
+    )
+
+    row += 1
+
+    header = (
+        '%-28s '
+        '%12s '
+        '%12s '
+        '%12s '
+        '%8s'
+        % (
+            'OST',
+            'Used TiB',
+            'Free TiB',
+            'Total TiB',
+            'Used %'
+        )
+    )
+
+    safe_addstr(
+        window,
+        row,
+        0,
+        header
+    )
+
+    row += 1
+
+    for name in sorted(
+            monitor.oss.targets.keys()):
+
+        target = (
+            monitor.oss.targets[name]
+        )
+
+        if not target.success:
+            continue
+
+        total = target.metrics.get(
+            'kbytestotal',
+            0.0
+        )
+
+        free = target.metrics.get(
+            'kbytesfree',
+            0.0
+        )
+
+        used = max(
+            0.0,
+            total - free
+        )
+
+        text = (
+            '%-28s '
+            '%12.2f '
+            '%12.2f '
+            '%12.2f '
+            '%7.1f%%'
+            % (
+                name,
+                tib(used),
+                tib(free),
+                tib(total),
+                percent(
+                    used,
+                    total
+                )
+            )
+        )
+
+        safe_addstr(
+            window,
+            row,
+            0,
+            text
+        )
+
+        row += 1
+
+    totals = monitor.oss_totals()
+
+    total = totals['kbytestotal']
+    free = totals['kbytesfree']
+    used = max(
+        0.0,
+        total - free
+    )
+
+    text = (
+        '%-28s '
+        '%12.2f '
+        '%12.2f '
+        '%12.2f '
+        '%7.1f%%'
+        % (
+            'TOTAL',
+            tib(used),
+            tib(free),
+            tib(total),
+            percent(
+                used,
+                total
+            )
+        )
+    )
+
+    safe_addstr(
+        window,
+        row,
+        0,
+        text,
+        curses.A_BOLD
+    )
+
+    return row + 2
+
+
+# ============================================================================
+# DRAW OST FILE COUNTS
+# ============================================================================
+
+def draw_files(
+        window,
+        monitor,
+        row):
+
+    safe_addstr(
+        window,
+        row,
+        0,
+        'OST FILE COUNTS',
+        curses.A_BOLD
+    )
+
+    row += 1
+
+    header = (
+        '%-28s '
+        '%12s '
+        '%12s '
+        '%12s '
+        '%8s'
+        % (
+            'OST',
+            'Used M',
+            'Free M',
+            'Total M',
+            'Used %'
+        )
+    )
+
+    safe_addstr(
+        window,
+        row,
+        0,
+        header
+    )
+
+    row += 1
+
+    for name in sorted(
+            monitor.oss.targets.keys()):
+
+        target = (
+            monitor.oss.targets[name]
+        )
+
+        if not target.success:
+            continue
+
+        total = target.metrics.get(
+            'filestotal',
+            0.0
+        )
+
+        free = target.metrics.get(
+            'filesfree',
+            0.0
+        )
+
+        used = max(
+            0.0,
+            total - free
+        )
+
+        text = (
+            '%-28s '
+            '%12.2f '
+            '%12.2f '
+            '%12.2f '
+            '%7.1f%%'
+            % (
+                name,
+                used / 1000000.0,
+                free / 1000000.0,
+                total / 1000000.0,
+                percent(
+                    used,
+                    total
+                )
+            )
+        )
+
+        safe_addstr(
+            window,
+            row,
+            0,
+            text
+        )
+
+        row += 1
+
+    totals = monitor.oss_totals()
+
+    total = totals['filestotal']
+    free = totals['filesfree']
+    used = max(
+        0.0,
+        total - free
+    )
+
+    text = (
+        '%-28s '
+        '%12.2f '
+        '%12.2f '
+        '%12.2f '
+        '%7.1f%%'
+        % (
+            'TOTAL',
+            used / 1000000.0,
+            free / 1000000.0,
+            total / 1000000.0,
+            percent(
+                used,
+                total
+            )
+        )
+    )
+
+    safe_addstr(
+        window,
+        row,
+        0,
+        text,
+        curses.A_BOLD
+    )
+
+    return row + 2
+
+
+# ============================================================================
+# DRAW SCREEN
+# ============================================================================
+
+def draw_screen(
+        window,
+        monitor):
+
+    clear_window(
+        window
+    )
+
+    height, width = (
+        window.getmaxyx()
+    )
+
+    safe_addstr(
+        window,
+        0,
+        0,
+        'LUSTRE STORAGE MONITOR',
+        curses.A_BOLD
+    )
+
+    totals = monitor.oss_totals()
+
+    read_rate = totals[
+        'read_bytes_rate'
+    ]
+
+    write_rate = totals[
+        'write_bytes_rate'
+    ]
+
+    mdt_totals = (
+        monitor.mdt_operation_totals()
+    )
+
+    mdt_iops = 0.0
+
+    for value in mdt_totals.values():
+        mdt_iops += value
+
+    safe_addstr(
+        window,
+        1,
+        0,
+        (
+            'Read %.2f MiB/s   '
+            'Write %.2f MiB/s   '
+            'MDT OPS %.1f/s'
+        ) % (
+            mib(read_rate),
+            mib(write_rate),
+            mdt_iops
+        )
+    )
+
+    row = 3
+
+    # ------------------------------------------------------------------------
+    # Rates first.
+    # ------------------------------------------------------------------------
+
+    row = draw_oss_io(
+        window,
+        monitor,
+        row
+    )
+
+    if row >= height - 2:
+        window.refresh()
+        return
+
+    row = draw_operation_grid(
+        window,
+        row,
+        'OSS OPERATIONS / SEC',
+        OSS_OPERATIONS,
+        monitor.oss_operation_totals(),
+        25
+    )
+
+    if row >= height - 2:
+        window.refresh()
+        return
+
+    row = draw_mdt(
+        window,
+        monitor,
+        row
+    )
+
+    if row >= height - 2:
+        window.refresh()
+        return
+
+    row = draw_operation_grid(
+        window,
+        row,
+        'MDT DETAILED OPERATIONS / SEC',
+        MDT_OPERATIONS,
+        monitor.mdt_operation_totals(),
+        25
+    )
+
+    if row >= height - 2:
+        window.refresh()
+        return
+
+    # ------------------------------------------------------------------------
+    # STATUS.
+    # ------------------------------------------------------------------------
+
+    row = draw_status(
+        window,
+        monitor,
+        row
+    )
+
+    if row >= height - 2:
+        window.refresh()
+        return
+
+    # ------------------------------------------------------------------------
+    # Capacity and file counts deliberately moved to the bottom.
+    # ------------------------------------------------------------------------
+
+    row += 1
+
+    row = draw_capacity(
+        window,
+        monitor,
+        row
+    )
+
+    if row >= height - 2:
+        window.refresh()
+        return
+
+    draw_files(
+        window,
+        monitor,
+        row
+    )
+
+    safe_addstr(
+        window,
+        height - 1,
+        0,
+        'q=quit   r=refresh',
+        curses.A_DIM
+    )
+
+    window.refresh()
+
+
+# ============================================================================
+# CURSES LOOP
+# ============================================================================
+
+def curses_main(
+        window,
+        monitor):
+
+    try:
+
+        curses.curs_set(0)
+
+    except curses.error:
+
+        pass
+
+    window.nodelay(True)
+
+    window.keypad(True)
+
+    first = True
+
+    while True:
+
+        key = window.getch()
+
+        if key in (
+                ord('q'),
+                ord('Q')):
+
+            break
+
+        force_refresh = (
+            key in (
+                ord('r'),
+                ord('R')
+            )
+        )
+
+        should_collect = first
+
+        if not first:
+
+            elapsed = (
+                monotonic() -
+                monitor.last_collection
+            )
+
+            if elapsed >= monitor.interval:
+
+                should_collect = True
+
+        if force_refresh:
+
+            should_collect = True
+
+        if should_collect:
+
+            try:
+
+                monitor.collect()
+
+                draw_screen(
+                    window,
+                    monitor
+                )
+
+            except Exception as exc:
+
+                clear_window(
+                    window
+                )
+
+                safe_addstr(
+                    window,
+                    0,
+                    0,
+                    'ERROR',
+                    curses.A_BOLD
+                )
+
+                safe_addstr(
+                    window,
+                    1,
+                    0,
+                    str(exc)
+                )
+
+                safe_addstr(
+                    window,
+                    3,
+                    0,
+                    'Press q to quit.'
+                )
+
+                window.refresh()
+
+            first = False
+
+        time.sleep(
+            0.05
+        )
+
+
+# ============================================================================
+# TEXT MODE HELPERS
+# ============================================================================
+
+def print_operation_grid(
+        operations,
+        totals,
+        columns=4,
+        column_width=25):
+
+    for start in range(
+            0,
+            len(operations),
+            columns):
+
+        parts = []
+
+        for operation in operations[
+                start:start + columns]:
+
+            parts.append(
+                '%-12s %10s'
+                % (
+                    operation,
+                    format_rate(
+                        totals.get(
+                            operation,
+                            0.0
+                        )
+                    )
+                )
+            )
+
+        print '  '.join(
+            parts
+        )
+
+
+# ============================================================================
+# TEXT MODE
+# ============================================================================
+
+def print_once(
+        monitor):
+
+    monitor.collect()
+
+    totals = monitor.oss_totals()
+
+    oss_ops = (
+        monitor.oss_operation_totals()
+    )
+
+    mdt_ops = (
+        monitor.mdt_operation_totals()
+    )
+
+    print
+    print 'LUSTRE STORAGE MONITOR'
+    print '=' * 100
+
+    # ------------------------------------------------------------------------
+    # OSS I/O
+    # ------------------------------------------------------------------------
+
+    print
+    print 'OSS I/O'
+    print '-' * 100
+
+    print (
+        '%-28s '
+        '%14s '
+        '%14s '
+        '%12s '
+        '%12s'
+        % (
+            'OST',
+            'Read MiB/s',
+            'Write MiB/s',
+            'getattr/s',
+            'setattr/s'
+        )
+    )
+
+    for name in sorted(
+            monitor.oss.targets.keys()):
+
+        target = (
+            monitor.oss.targets[name]
+        )
+
+        if not target.success:
+            continue
+
+        print (
+            '%-28s '
+            '%14.2f '
+            '%14.2f '
+            '%12s '
+            '%12s'
+            % (
+                name,
+                mib(
+                    target.rates.get(
+                        'read_bytes',
+                        0.0
+                    )
+                ),
+                mib(
+                    target.rates.get(
+                        'write_bytes',
+                        0.0
+                    )
+                ),
+                format_rate(
+                    target.rates.get(
+                        'getattr',
+                        0.0
+                    )
+                ),
+                format_rate(
+                    target.rates.get(
+                        'setattr',
+                        0.0
+                    )
+                )
+            )
+        )
+
+    print (
+        '%-28s '
+        '%14.2f '
+        '%14.2f '
+        '%12s '
+        '%12s'
+        % (
+            'TOTAL',
+            mib(
+                totals[
+                    'read_bytes_rate'
+                ]
+            ),
+            mib(
+                totals[
+                    'write_bytes_rate'
+                ]
+            ),
+            format_rate(
+                oss_ops[
+                    'getattr'
+                ]
+            ),
+            format_rate(
+                oss_ops[
+                    'setattr'
+                ]
+            )
+        )
+    )
+
+    # ------------------------------------------------------------------------
+    # OSS detailed operations.
+    # ------------------------------------------------------------------------
+
+    print
+    print 'OSS OPERATIONS / SEC'
+    print '-' * 100
+
+    print_operation_grid(
+        OSS_OPERATIONS,
+        oss_ops,
+        4,
+        25
+    )
+
+    # ------------------------------------------------------------------------
+    # MDT primary operations.
+    # ------------------------------------------------------------------------
+
+    print
+    print 'MDT OPERATIONS / SEC'
+    print '-' * 100
+
+    print (
+        '%-28s '
+        '%12s '
+        '%12s '
+        '%12s '
+        '%12s'
+        % (
+            'MDT',
+            'open/s',
+            'close/s',
+            'getattr/s',
+            'setattr/s'
+        )
+    )
+
+    for name in sorted(
+            monitor.mdt.targets.keys()):
+
+        target = (
+            monitor.mdt.targets[name]
+        )
+
+        if not target.success:
+            continue
+
+        print (
+            '%-28s '
+            '%12s '
+            '%12s '
+            '%12s '
+            '%12s'
+            % (
+                name,
+                format_rate(
+                    target.rates.get(
+                        'open',
+                        0.0
+                    )
+                ),
+                format_rate(
+                    target.rates.get(
+                        'close',
+                        0.0
+                    )
+                ),
+                format_rate(
+                    target.rates.get(
+                        'getattr',
+                        0.0
+                    )
+                ),
+                format_rate(
+                    target.rates.get(
+                        'setattr',
+                        0.0
+                    )
+                )
+            )
+        )
+
+    print (
+        '%-28s '
+        '%12s '
+        '%12s '
+        '%12s '
+        '%12s'
+        % (
+            'TOTAL',
+            format_rate(
+                mdt_ops['open']
+            ),
+            format_rate(
+                mdt_ops['close']
+            ),
+            format_rate(
+                mdt_ops['getattr']
+            ),
+            format_rate(
+                mdt_ops['setattr']
+            )
+        )
+    )
+
+    # ------------------------------------------------------------------------
+    # MDT detailed operations.
+    # ------------------------------------------------------------------------
+
+    print
+    print 'MDT DETAILED OPERATIONS / SEC'
+    print '-' * 100
+
+    print_operation_grid(
+        MDT_OPERATIONS,
+        mdt_ops,
+        4,
+        25
+    )
+
+    # ------------------------------------------------------------------------
+    # STATUS.
+    # ------------------------------------------------------------------------
+
+    print
+    print 'STATUS'
+    print '-' * 100
+
+    oss_ok = []
+    oss_bad = []
+
+    for host in monitor.oss_hosts:
+
+        if host in monitor.oss_errors:
+
+            oss_bad.append(
+                '%s:%s'
+                % (
+                    host,
+                    monitor.oss_errors[
+                        host
+                    ]
+                )
+            )
+
+        else:
+
+            oss_ok.append(host)
+
+    mds_ok = []
+    mds_bad = []
+
+    for host in monitor.mds_hosts:
+
+        if host in monitor.mds_errors:
+
+            mds_bad.append(
+                '%s:%s'
+                % (
+                    host,
+                    monitor.mds_errors[
+                        host
+                    ]
+                )
+            )
+
+        else:
+
+            mds_ok.append(host)
+
+    if oss_bad:
+
+        print (
+            'OSS OK[%s] ERROR[%s]'
+            % (
+                ','.join(oss_ok),
+                ','.join(oss_bad)
+            )
+        )
+
+    else:
+
+        print (
+            'OSS OK[%s]'
+            % ','.join(oss_ok)
+        )
+
+    if mds_bad:
+
+        print (
+            'MDS OK[%s] ERROR[%s]'
+            % (
+                ','.join(mds_ok),
+                ','.join(mds_bad)
+            )
+        )
+
+    else:
+
+        print (
+            'MDS OK[%s]'
+            % ','.join(mds_ok)
+        )
+
+    # ------------------------------------------------------------------------
+    # OST capacity at bottom.
+    # ------------------------------------------------------------------------
+
+    print
+    print 'OST CAPACITY'
+    print '-' * 100
+
+    print (
+        '%-28s '
+        '%12s '
+        '%12s '
+        '%12s '
+        '%8s'
+        % (
+            'OST',
+            'Used TiB',
+            'Free TiB',
+            'Total TiB',
+            'Used %'
+        )
+    )
+
+    for name in sorted(
+            monitor.oss.targets.keys()):
+
+        target = (
+            monitor.oss.targets[name]
+        )
+
+        if not target.success:
+            continue
+
+        total = target.metrics.get(
+            'kbytestotal',
+            0.0
+        )
+
+        free = target.metrics.get(
+            'kbytesfree',
+            0.0
+        )
+
+        used = max(
+            0.0,
+            total - free
+        )
+
+        print (
+            '%-28s '
+            '%12.2f '
+            '%12.2f '
+            '%12.2f '
+            '%7.1f%%'
+            % (
+                name,
+                tib(used),
+                tib(free),
+                tib(total),
+                percent(
+                    used,
+                    total
+                )
+            )
+        )
+
+    total = totals[
+        'kbytestotal'
+    ]
+
+    free = totals[
+        'kbytesfree'
+    ]
+
+    used = max(
+        0.0,
+        total - free
+    )
+
+    print (
+        '%-28s '
+        '%12.2f '
+        '%12.2f '
+        '%12.2f '
+        '%7.1f%%'
+        % (
+            'TOTAL',
+            tib(used),
+            tib(free),
+            tib(total),
+            percent(
+                used,
+                total
+            )
+        )
+    )
+
+    # ------------------------------------------------------------------------
+    # OST file counts at very bottom.
+    # ------------------------------------------------------------------------
+
+    print
+    print 'OST FILE COUNTS'
+    print '-' * 100
+
+    print (
+        '%-28s '
+        '%12s '
+        '%12s '
+        '%12s '
+        '%8s'
+        % (
+            'OST',
+            'Used M',
+            'Free M',
+            'Total M',
+            'Used %'
+        )
+    )
+
+    for name in sorted(
+            monitor.oss.targets.keys()):
+
+        target = (
+            monitor.oss.targets[name]
+        )
+
+        if not target.success:
+            continue
+
+        total = target.metrics.get(
+            'filestotal',
+            0.0
+        )
+
+        free = target.metrics.get(
+            'filesfree',
+            0.0
+        )
+
+        used = max(
+            0.0,
+            total - free
+        )
+
+        print (
+            '%-28s '
+            '%12.2f '
+            '%12.2f '
+            '%12.2f '
+            '%7.1f%%'
+            % (
+                name,
+                used / 1000000.0,
+                free / 1000000.0,
+                total / 1000000.0,
+                percent(
+                    used,
+                    total
+                )
+            )
+        )
+
+    total = totals[
+        'filestotal'
+    ]
+
+    free = totals[
+        'filesfree'
+    ]
+
+    used = max(
+        0.0,
+        total - free
+    )
+
+    print (
+        '%-28s '
+        '%12.2f '
+        '%12.2f '
+        '%12.2f '
+        '%7.1f%%'
+        % (
+            'TOTAL',
+            used / 1000000.0,
+            free / 1000000.0,
+            total / 1000000.0,
+            percent(
+                used,
+                total
+            )
+        )
+    )
+
+    print
+
+
+# ============================================================================
+# COMMAND LINE
+# ============================================================================
+
+def parse_arguments():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            'Lustre storage performance '
+            'monitor for Python 2.7.'
+        )
+    )
+
+    parser.add_argument(
+        '--oss',
+        action='append',
+        dest='oss_hosts',
+        help=(
+            'OSS hostname. '
+            'Can be specified multiple times.'
+        )
+    )
+
+    parser.add_argument(
+        '--mds',
+        action='append',
+        dest='mds_hosts',
+        help=(
+            'MDS hostname. '
+            'Can be specified multiple times.'
+        )
+    )
+
+    parser.add_argument(
+        '--interval',
+        type=float,
+        default=DEFAULT_INTERVAL,
+        help=(
+            'Polling interval in seconds. '
+            'Default: 3'
+        )
+    )
+
+    parser.add_argument(
+        '--ssh-timeout',
+        type=float,
+        default=DEFAULT_SSH_TIMEOUT,
+        help=(
+            'SSH timeout in seconds. '
+            'Default: 15'
+        )
+    )
+
+    parser.add_argument(
+        '--once',
+        action='store_true',
+        help=(
+            'Collect once and print text. '
+            'Useful for debugging.'
+        )
+    )
+
+    return parser.parse_args()
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+
+    args = parse_arguments()
+
+    if args.oss_hosts:
+
+        oss_hosts = args.oss_hosts
+
+    else:
+
+        oss_hosts = DEFAULT_OSS_HOSTS
+
+    if args.mds_hosts:
+
+        mds_hosts = args.mds_hosts
+
+    else:
+
+        mds_hosts = DEFAULT_MDS_HOSTS
+
+    if args.interval <= 0:
+
+        print >> sys.stderr, (
+            'ERROR: interval must be > 0'
+        )
+
+        return 1
+
+    if args.ssh_timeout <= 0:
+
+        print >> sys.stderr, (
+            'ERROR: ssh timeout must be > 0'
+        )
+
+        return 1
+
+    monitor = LustreMonitor(
+        oss_hosts,
+        mds_hosts,
+        args.interval,
+        args.ssh_timeout
+    )
+
+    if args.once:
+
+        try:
+
+            print_once(
+                monitor
+            )
+
+        except KeyboardInterrupt:
+
+            return 130
+
+        except Exception as exc:
+
+            print >> sys.stderr, (
+                'ERROR: %s'
+                % str(exc)
+            )
+
+            return 1
+
+        return 0
+
+    try:
+
+        curses.wrapper(
+            curses_main,
+            monitor
+        )
+
+    except KeyboardInterrupt:
+
+        return 130
+
+    except Exception as exc:
+
+        print >> sys.stderr, (
+            'ERROR: %s'
+            % str(exc)
+        )
+
+        return 1
+
+    return 0
+
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+if __name__ == '__main__':
+
+    sys.exit(
+        main()
+    )
