@@ -1,72 +1,37 @@
 #!/usr/bin/env python2
+# -*- coding: utf-8 -*-
 
 """
 Lustre Storage Performance Monitor
 ==================================
 
-Python 2.7 compatible version.
+Python 2.7 compatible.
 
-This is a lightweight Lustre monitoring tool using:
+Purpose:
+    Lightweight monitoring of Lustre OSS and MDS performance.
 
-    - Python 2.7 standard library
+Requirements:
+    - Python 2.7
     - ssh
-    - /usr/sbin/lctl
+    - /usr/sbin/lctl on remote Lustre servers
+    - SSH key authentication
     - curses
-    - threading
 
-Remote access must work using SSH keys.
-
-Example:
+Usage:
 
     python lustre_monitor.py
 
-    python lustre_monitor.py \
-        --oss oss1 \
-        --oss oss2 \
-        --mds mds1
+    python lustre_monitor.py --oss oss1 --oss oss2 --mds mds1
 
-    python lustre_monitor.py \
-        --oss oss1 \
-        --oss oss2 \
-        --mds mds1 \
-        --interval 5
+    python lustre_monitor.py --interval 5
 
     python lustre_monitor.py --once
 
-Press:
+Keys:
 
     q       Quit
     r       Refresh immediately
-
-
-IMPORTANT
----------
-
-This program intentionally keeps the metric model relatively generic.
-
-Lustre installations differ significantly in:
-
-    - Lustre versions
-    - parameter names
-    - number of OSTs
-    - number of MDTs
-    - naming conventions
-
-The parser therefore attempts to extract metrics rather than relying
-on a fixed positional layout wherever possible.
-
-The next logical enhancement would be to maintain separate objects
-for:
-
-    OSS -> OST -> metrics
-
-and:
-
-    MDS -> MDT -> metrics
-
-rather than aggregating everything at the host level.
 """
-
 
 import argparse
 import curses
@@ -78,7 +43,17 @@ import time
 
 
 # ============================================================================
-# CONFIGURATION
+# PYTHON 2.7 COMPATIBILITY
+# ============================================================================
+
+try:
+    monotonic = time.monotonic
+except AttributeError:
+    monotonic = time.time
+
+
+# ============================================================================
+# DEFAULT CONFIGURATION
 # ============================================================================
 
 DEFAULT_OSS_HOSTS = [
@@ -95,7 +70,7 @@ DEFAULT_SSH_TIMEOUT = 10.0
 
 
 # ============================================================================
-# LUSTRE PARAMETER PATTERNS
+# LUSTRE PARAMETERS
 # ============================================================================
 
 OSS_PARAMS = [
@@ -112,7 +87,7 @@ MDS_PARAMS = [
 
 
 # ============================================================================
-# OPERATION LIST
+# MDT OPERATIONS
 # ============================================================================
 
 MDT_OPERATIONS = [
@@ -136,19 +111,12 @@ MDT_OPERATIONS = [
 
 
 # ============================================================================
-# HOST RESULT
+# DATA STRUCTURES
 # ============================================================================
 
 class HostResult(object):
 
-    def __init__(
-        self,
-        host,
-        role,
-        success,
-        lines=None,
-        error=''
-    ):
+    def __init__(self, host, role, success, lines=None, error=''):
 
         self.host = host
         self.role = role
@@ -161,47 +129,32 @@ class HostResult(object):
         self.error = error
 
 
-# ============================================================================
-# HOST METRICS
-# ============================================================================
-
 class HostMetrics(object):
 
     def __init__(self):
 
         self.current = {}
-
         self.previous = {}
-
         self.rates = {}
 
         self.current_time = 0.0
-
         self.previous_time = 0.0
 
         self.success = True
-
         self.error = ''
 
-
-# ============================================================================
-# SYSTEM METRICS
-# ============================================================================
 
 class SystemMetrics(object):
 
     def __init__(self):
 
         self.files_total = 0.0
-
         self.files_free = 0.0
 
         self.kbytes_total = 0.0
-
         self.kbytes_free = 0.0
 
         self.read_bytes_per_sec = 0.0
-
         self.write_bytes_per_sec = 0.0
 
         self.mdt_rates = {}
@@ -211,93 +164,54 @@ class SystemMetrics(object):
 # UTILITY FUNCTIONS
 # ============================================================================
 
-def safe_float(
-    value,
-    default=0.0
-):
+def safe_float(value, default=0.0):
 
     try:
         return float(value)
-
-    except (
-        TypeError,
-        ValueError
-    ):
-
+    except (TypeError, ValueError):
         return default
 
 
-def calculate_rate(
-    current,
-    previous,
-    elapsed
-):
+def calculate_rate(current, previous, elapsed):
 
     if elapsed <= 0:
-
         return 0.0
 
-    # Lustre counters can reset after a restart.
-    #
-    # Do not report a huge negative rate or a huge rate caused
-    # by a counter rollover/reset.
-
+    # Lustre counters can reset after a reboot or service restart.
     if current < previous:
-
         return 0.0
 
-    return (
-        current - previous
-    ) / elapsed
+    return (current - previous) / elapsed
 
 
-def bytes_to_mib(
-    value
-):
+def bytes_to_mib(value):
 
-    return (
-        value /
-        (1024.0 * 1024.0)
+    return value / (1024.0 * 1024.0)
+
+
+def kbytes_to_tib(value):
+
+    return value / (
+        1024.0 *
+        1024.0 *
+        1024.0
     )
 
 
-def kbytes_to_tib(
-    value
-):
-
-    return (
-        value /
-        (1024.0 *
-         1024.0 *
-         1024.0)
-    )
-
-
-def percent_used(
-    total,
-    free
-):
+def percent_used(total, free):
 
     if total <= 0:
-
         return 0.0
 
     used = total - free
 
     if used < 0:
-
         used = 0.0
 
-    return (
-        100.0 *
-        used /
-        total
-    )
+    return 100.0 * used / total
 
 
-def extract_numbers(
-    text
-):
+def extract_numbers(text):
 
     pattern = (
         r'[-+]?(?:'
@@ -307,52 +221,34 @@ def extract_numbers(
         r')(?:[eE][-+]?\d+)?'
     )
 
-    result = []
+    values = []
 
-    for value in re.findall(
-        pattern,
-        text
-    ):
+    for value in re.findall(pattern, text):
 
         try:
-
-            result.append(
-                float(value)
-            )
-
+            values.append(float(value))
         except ValueError:
-
             pass
 
-    return result
+    return values
 
 
-def extract_first_number(
-    text
-):
+def extract_first_number(text):
 
-    numbers = extract_numbers(
-        text
-    )
+    values = extract_numbers(text)
 
-    if not numbers:
-
+    if not values:
         return None
 
-    return numbers[0]
+    return values[0]
 
 
-def normalize_key(
-    key
-):
+def normalize_key(key):
 
     key = key.strip()
 
     if '.' in key:
-
-        key = key.split(
-            '.'
-        )[-1]
+        key = key.split('.')[-1]
 
     return key.strip()
 
@@ -361,50 +257,43 @@ def normalize_key(
 # SSH COMMAND
 # ============================================================================
 
-def build_lctl_command(
-    host,
-    params,
-    timeout
-):
+def build_lctl_command(host, params, timeout):
 
-    connect_timeout = max(
-        1,
-        int(timeout)
-    )
+    connect_timeout = max(1, int(timeout))
 
     command = [
         'ssh',
-
         '-o',
         'BatchMode=yes',
-
         '-o',
-        'ConnectTimeout=%d'
-        % connect_timeout,
-
+        'ConnectTimeout=%d' % connect_timeout,
         host,
-
         '/usr/sbin/lctl',
         'get_param'
     ]
 
-    command.extend(
-        params
-    )
+    command.extend(params)
 
     return command
 
 
 # ============================================================================
-# SSH COLLECTION
+# TERMINATE PROCESS
 # ============================================================================
 
-def fetch_host(
-    host,
-    role,
-    params,
-    timeout
-):
+def terminate_process(process):
+
+    try:
+        process.terminate()
+    except Exception:
+        pass
+
+
+# ============================================================================
+# FETCH ONE HOST
+# ============================================================================
+
+def fetch_host(host, role, params, timeout):
 
     command = build_lctl_command(
         host,
@@ -429,53 +318,26 @@ def fetch_host(
             error=str(exc)
         )
 
-    # ------------------------------------------------------------------------
-    # Python 2.7 does not provide subprocess.run().
-    #
-    # communicate() is used here.
-    #
-    # ssh itself has ConnectTimeout, while this also gives us a way to
-    # terminate a hung process.
-    # ------------------------------------------------------------------------
+    timer = threading.Timer(
+        timeout + 5.0,
+        terminate_process,
+        [process]
+    )
 
-    timer = None
-
-    def terminate_process():
-
-        try:
-
-            process.terminate()
-
-        except Exception:
-
-            pass
+    timer.daemon = True
+    timer.start()
 
     try:
 
-        timer = threading.Timer(
-            timeout + 5.0,
-            terminate_process
-        )
-
-        timer.daemon = True
-
-        timer.start()
-
-        stdout_data, stderr_data = (
-            process.communicate()
-        )
+        stdout_data, stderr_data = process.communicate()
 
     finally:
 
-        if timer is not None:
-
-            timer.cancel()
+        timer.cancel()
 
     if process.returncode != 0:
 
-        error = (
-            stderr_data.strip()
-        )
+        error = stderr_data.strip()
 
         if not error:
 
@@ -503,14 +365,13 @@ def fetch_host(
 # THREAD WORKER
 # ============================================================================
 
-def worker(
-    host,
-    role,
-    params,
-    timeout,
-    results,
-    lock
-):
+def collection_worker(
+        host,
+        role,
+        params,
+        timeout,
+        results,
+        lock):
 
     result = fetch_host(
         host,
@@ -519,21 +380,23 @@ def worker(
         timeout
     )
 
-    with lock:
+    lock.acquire()
 
+    try:
         results[host] = result
+    finally:
+        lock.release()
 
 
 # ============================================================================
-# CONCURRENT HOST COLLECTION
+# COLLECT MULTIPLE HOSTS IN PARALLEL
 # ============================================================================
 
 def collect_hosts(
-    hosts,
-    role,
-    params,
-    timeout
-):
+        hosts,
+        role,
+        params,
+        timeout):
 
     results = {}
 
@@ -544,7 +407,7 @@ def collect_hosts(
     for host in hosts:
 
         thread = threading.Thread(
-            target=worker,
+            target=collection_worker,
             args=(
                 host,
                 role,
@@ -559,19 +422,13 @@ def collect_hosts(
 
         thread.start()
 
-        threads.append(
-            thread
-        )
+        threads.append(thread)
 
     for thread in threads:
 
         thread.join(
-            timeout + 6.0
+            timeout + 7.0
         )
-
-    # ------------------------------------------------------------------------
-    # Any thread that is still alive has a problem.
-    # ------------------------------------------------------------------------
 
     for host in hosts:
 
@@ -581,21 +438,84 @@ def collect_hosts(
                 host,
                 role,
                 False,
-                error=(
-                    'collection timeout'
-                )
+                error='collection timeout'
             )
 
     return results
 
 
 # ============================================================================
-# LCTL PARSER
+# PARSE ONE MDT/OST STATISTICS LINE
 # ============================================================================
 
-def parse_lctl_output(
-    lines
-):
+def parse_stat_line(line, role):
+
+    fields = line.strip().split()
+
+    if len(fields) < 2:
+        return None, None
+
+    key = normalize_key(fields[0])
+
+    # ------------------------------------------------------------------------
+    # snapshot_time
+    # ------------------------------------------------------------------------
+
+    if key == 'snapshot_time':
+
+        value = extract_first_number(
+            ' '.join(fields[1:])
+        )
+
+        return key, value
+
+    # ------------------------------------------------------------------------
+    # MDT md_stats
+    #
+    # Typical Lustre output:
+    #
+    # open 0 14180345 samples [reqs]
+    #
+    # close 1 10131059 samples [reqs]
+    #
+    # The accumulated counter is normally the second numeric field.
+    # ------------------------------------------------------------------------
+
+    if role == 'MDT':
+
+        values = []
+
+        for field in fields[1:]:
+
+            value = extract_first_number(field)
+
+            if value is not None:
+                values.append(value)
+
+        if len(values) >= 2:
+            return key, values[1]
+
+        if len(values) == 1:
+            return key, values[0]
+
+        return None, None
+
+    # ------------------------------------------------------------------------
+    # Generic statistics line
+    # ------------------------------------------------------------------------
+
+    value = extract_first_number(
+        ' '.join(fields[1:])
+    )
+
+    return key, value
+
+
+# ============================================================================
+# PARSE LCTL OUTPUT
+# ============================================================================
+
+def parse_host_lines(lines, role):
 
     metrics = {}
 
@@ -604,72 +524,40 @@ def parse_lctl_output(
         line = raw_line.strip()
 
         if not line:
-
             continue
 
-        # ====================================================================
-        # Format:
+        # --------------------------------------------------------------------
+        # key=value format
+        #
+        # Example:
         #
         # obdfilter.foo-OST0000.kbytesavail=123456
-        # ====================================================================
+        # --------------------------------------------------------------------
 
         if '=' in line:
 
-            left, right = (
-                line.split(
-                    '=',
-                    1
-                )
-            )
+            left, right = line.split('=', 1)
 
-            key = normalize_key(
-                left
-            )
+            key = normalize_key(left)
 
-            value = extract_first_number(
-                right
-            )
+            value = extract_first_number(right)
 
-            if (
-                key and
-                value is not None
-            ):
+            if key and value is not None:
 
                 metrics[key] = value
 
             continue
 
-        # ====================================================================
-        # Format:
-        #
-        # snapshot_time 1621376949.986194443 secs.nsecs
-        #
-        # or:
-        #
-        # open 0 14180345 samples [reqs]
-        # ====================================================================
+        # --------------------------------------------------------------------
+        # Statistics format
+        # --------------------------------------------------------------------
 
-        fields = line.split(
-            None,
-            1
+        key, value = parse_stat_line(
+            line,
+            role
         )
 
-        if len(fields) < 2:
-
-            continue
-
-        key = normalize_key(
-            fields[0]
-        )
-
-        value = extract_first_number(
-            fields[1]
-        )
-
-        if (
-            key and
-            value is not None
-        ):
+        if key and value is not None:
 
             metrics[key] = value
 
@@ -677,42 +565,36 @@ def parse_lctl_output(
 
 
 # ============================================================================
-# PARSE HOST RESULT
+# CONVERT HOST RESULT TO METRICS
 # ============================================================================
 
-def parse_host_result(
-    result
-):
+def parse_host_result(result):
 
     metrics = HostMetrics()
 
     if not result.success:
 
         metrics.success = False
-
-        metrics.error = (
-            result.error
-        )
+        metrics.error = result.error
 
         return metrics
 
-    metrics.current = (
-        parse_lctl_output(
-            result.lines
-        )
+    metrics.current = parse_host_lines(
+        result.lines,
+        result.role
     )
 
-    timestamp = (
-        metrics.current.get(
-            'snapshot_time'
-        )
+    timestamp = metrics.current.get(
+        'snapshot_time'
     )
 
     if timestamp is not None:
 
-        metrics.current_time = (
-            timestamp
-        )
+        metrics.current_time = timestamp
+
+    else:
+
+        metrics.current_time = time.time()
 
     return metrics
 
@@ -721,22 +603,14 @@ def parse_host_result(
 # CALCULATE HOST RATES
 # ============================================================================
 
-def calculate_host_rates(
-    metrics
-):
+def calculate_host_rates(metrics):
 
     if not metrics.success:
-
         metrics.rates = {}
-
         return
 
     if not metrics.previous:
-
-        # First successful sample.
-
         metrics.rates = {}
-
         return
 
     elapsed = (
@@ -745,30 +619,19 @@ def calculate_host_rates(
     )
 
     if elapsed <= 0:
-
         metrics.rates = {}
-
         return
 
     rates = {}
 
     for key in metrics.current:
 
-        current_value = (
-            metrics.current.get(
-                key
-            )
-        )
-
-        previous_value = (
-            metrics.previous.get(
-                key
-            )
-        )
-
-        if previous_value is None:
-
+        if key not in metrics.previous:
             continue
+
+        current_value = metrics.current[key]
+
+        previous_value = metrics.previous[key]
 
         rates[key] = calculate_rate(
             current_value,
@@ -780,21 +643,16 @@ def calculate_host_rates(
 
 
 # ============================================================================
-# AGGREGATE OSS
+# AGGREGATE OSS DATA
 # ============================================================================
 
-def aggregate_ost_metrics(
-    ost_metrics
-):
+def aggregate_ost_metrics(ost_metrics):
 
     system = SystemMetrics()
 
-    for metrics in (
-        ost_metrics.values()
-    ):
+    for metrics in ost_metrics.values():
 
         if not metrics.success:
-
             continue
 
         system.files_total += (
@@ -843,24 +701,20 @@ def aggregate_ost_metrics(
 
 
 # ============================================================================
-# AGGREGATE MDT
+# AGGREGATE MDT DATA
 # ============================================================================
 
 def aggregate_mdt_metrics(
-    mdt_metrics,
-    system
-):
+        mdt_metrics,
+        system):
 
     for operation in MDT_OPERATIONS:
 
         total = 0.0
 
-        for metrics in (
-            mdt_metrics.values()
-        ):
+        for metrics in mdt_metrics.values():
 
             if not metrics.success:
-
                 continue
 
             total += (
@@ -870,9 +724,7 @@ def aggregate_mdt_metrics(
                 )
             )
 
-        system.mdt_rates[
-            operation
-        ] = total
+        system.mdt_rates[operation] = total
 
 
 # ============================================================================
@@ -882,55 +734,41 @@ def aggregate_mdt_metrics(
 class LustreMonitor(object):
 
     def __init__(
-        self,
-        oss_hosts,
-        mds_hosts,
-        interval=DEFAULT_INTERVAL,
-        ssh_timeout=DEFAULT_SSH_TIMEOUT
-    ):
+            self,
+            oss_hosts,
+            mds_hosts,
+            interval=DEFAULT_INTERVAL,
+            ssh_timeout=DEFAULT_SSH_TIMEOUT):
 
-        # Remove duplicates while preserving order.
+        self.oss_hosts = []
 
-        self.oss_hosts = list(
-            dict.fromkeys(
-                oss_hosts
-            )
-        )
+        for host in oss_hosts:
 
-        self.mds_hosts = list(
-            dict.fromkeys(
-                mds_hosts
-            )
-        )
+            if host not in self.oss_hosts:
+                self.oss_hosts.append(host)
+
+        self.mds_hosts = []
+
+        for host in mds_hosts:
+
+            if host not in self.mds_hosts:
+                self.mds_hosts.append(host)
 
         self.interval = interval
-
-        self.ssh_timeout = (
-            ssh_timeout
-        )
+        self.ssh_timeout = ssh_timeout
 
         self.ost_metrics = {}
-
         self.mdt_metrics = {}
 
         for host in self.oss_hosts:
-
-            self.ost_metrics[
-                host
-            ] = HostMetrics()
+            self.ost_metrics[host] = HostMetrics()
 
         for host in self.mds_hosts:
+            self.mdt_metrics[host] = HostMetrics()
 
-            self.mdt_metrics[
-                host
-            ] = HostMetrics()
-
-        self.system = (
-            SystemMetrics()
-        )
+        self.system = SystemMetrics()
 
         self.last_poll_time = 0.0
-
 
     # ------------------------------------------------------------------------
     # COLLECT
@@ -938,176 +776,134 @@ class LustreMonitor(object):
 
     def collect(self):
 
-        # ====================================================================
-        # OSS
-        # ====================================================================
+        # --------------------------------------------------------------------
+        # Collect OSS
+        # --------------------------------------------------------------------
 
-        ost_results = (
-            collect_hosts(
-                self.oss_hosts,
-                'OSS',
-                OSS_PARAMS,
-                self.ssh_timeout
-            )
+        ost_results = collect_hosts(
+            self.oss_hosts,
+            'OSS',
+            OSS_PARAMS,
+            self.ssh_timeout
         )
 
-        # ====================================================================
-        # MDS
-        # ====================================================================
+        # --------------------------------------------------------------------
+        # Collect MDS
+        # --------------------------------------------------------------------
 
-        mdt_results = (
-            collect_hosts(
-                self.mds_hosts,
-                'MDS',
-                MDS_PARAMS,
-                self.ssh_timeout
-            )
+        mdt_results = collect_hosts(
+            self.mds_hosts,
+            'MDT',
+            MDS_PARAMS,
+            self.ssh_timeout
         )
 
-        # ====================================================================
+        # --------------------------------------------------------------------
         # Process OSS
-        # ====================================================================
+        # --------------------------------------------------------------------
 
         new_ost_metrics = {}
 
         for host in self.oss_hosts:
 
-            result = (
-                ost_results.get(
-                    host
-                )
-            )
+            result = ost_results.get(host)
 
             if result is None:
 
-                new_metrics = (
-                    HostMetrics()
-                )
+                current = HostMetrics()
 
-                new_metrics.success = False
+                current.success = False
 
-                new_metrics.error = (
+                current.error = (
                     'No result returned'
                 )
 
             else:
 
-                new_metrics = (
-                    parse_host_result(
-                        result
-                    )
+                current = parse_host_result(
+                    result
                 )
 
-            old_metrics = (
-                self.ost_metrics.get(
-                    host
-                )
-            )
+            previous = self.ost_metrics.get(host)
 
             if (
-                old_metrics is not None and
-                old_metrics.current and
-                new_metrics.success
+                previous is not None and
+                previous.current and
+                current.success
             ):
 
-                new_metrics.previous = (
-                    dict(
-                        old_metrics.current
-                    )
+                current.previous = dict(
+                    previous.current
                 )
 
-                new_metrics.previous_time = (
-                    old_metrics.current_time
+                current.previous_time = (
+                    previous.current_time
                 )
 
             calculate_host_rates(
-                new_metrics
+                current
             )
 
-            new_ost_metrics[
-                host
-            ] = new_metrics
+            new_ost_metrics[host] = current
 
-        self.ost_metrics = (
-            new_ost_metrics
-        )
+        self.ost_metrics = new_ost_metrics
 
-        # ====================================================================
+        # --------------------------------------------------------------------
         # Process MDS
-        # ====================================================================
+        # --------------------------------------------------------------------
 
         new_mdt_metrics = {}
 
         for host in self.mds_hosts:
 
-            result = (
-                mdt_results.get(
-                    host
-                )
-            )
+            result = mdt_results.get(host)
 
             if result is None:
 
-                new_metrics = (
-                    HostMetrics()
-                )
+                current = HostMetrics()
 
-                new_metrics.success = False
+                current.success = False
 
-                new_metrics.error = (
+                current.error = (
                     'No result returned'
                 )
 
             else:
 
-                new_metrics = (
-                    parse_host_result(
-                        result
-                    )
+                current = parse_host_result(
+                    result
                 )
 
-            old_metrics = (
-                self.mdt_metrics.get(
-                    host
-                )
-            )
+            previous = self.mdt_metrics.get(host)
 
             if (
-                old_metrics is not None and
-                old_metrics.current and
-                new_metrics.success
+                previous is not None and
+                previous.current and
+                current.success
             ):
 
-                new_metrics.previous = (
-                    dict(
-                        old_metrics.current
-                    )
+                current.previous = dict(
+                    previous.current
                 )
 
-                new_metrics.previous_time = (
-                    old_metrics.current_time
+                current.previous_time = (
+                    previous.current_time
                 )
 
             calculate_host_rates(
-                new_metrics
+                current
             )
 
-            new_mdt_metrics[
-                host
-            ] = new_metrics
+            new_mdt_metrics[host] = current
 
-        self.mdt_metrics = (
-            new_mdt_metrics
-        )
+        self.mdt_metrics = new_mdt_metrics
 
-        # ====================================================================
+        # --------------------------------------------------------------------
         # Aggregate
-        # ====================================================================
+        # --------------------------------------------------------------------
 
-        self.system = (
-            aggregate_ost_metrics(
-                self.ost_metrics
-            )
+        self.system = aggregate_ost_metrics(
+            self.ost_metrics
         )
 
         aggregate_mdt_metrics(
@@ -1115,24 +911,17 @@ class LustreMonitor(object):
             self.system
         )
 
-        self.last_poll_time = (
-            time.monotonic()
-        )
-
+        self.last_poll_time = monotonic()
 
     # ------------------------------------------------------------------------
     # IOPS
     # ------------------------------------------------------------------------
 
-    def calculate_iops(
-        self
-    ):
+    def calculate_iops(self):
 
         total = 0.0
 
-        for operation in (
-            MDT_OPERATIONS
-        ):
+        for operation in MDT_OPERATIONS:
 
             total += (
                 self.system.mdt_rates.get(
@@ -1149,37 +938,38 @@ class LustreMonitor(object):
 # ============================================================================
 
 def safe_addstr(
-    window,
-    row,
-    column,
-    text,
-    attr=0
-):
+        window,
+        row,
+        column,
+        text,
+        attribute=0):
 
     try:
 
-        height, width = (
-            window.getmaxyx()
-        )
+        height, width = window.getmaxyx()
 
-        if row < 0 or row >= height:
-
+        if row < 0:
             return
 
-        if column < 0 or column >= width:
-
+        if row >= height:
             return
 
-        available = max(
-            1,
-            width - column - 1
-        )
+        if column < 0:
+            return
+
+        if column >= width:
+            return
+
+        available = width - column - 1
+
+        if available <= 0:
+            return
 
         window.addstr(
             row,
             column,
             str(text)[:available],
-            attr
+            attribute
         )
 
     except curses.error:
@@ -1191,84 +981,56 @@ def safe_addstr(
 # FORMATTERS
 # ============================================================================
 
-def format_mib_rate(
-    bytes_per_second
-):
+def format_mib_rate(bytes_per_second):
 
-    return (
-        '%.3f MiB/s'
-        % bytes_to_mib(
+    return '%.3f MiB/s' % (
+        bytes_to_mib(
             bytes_per_second
         )
     )
 
 
-def format_rate(
-    value
-):
+def format_rate(value):
 
     if abs(value) >= 1000:
 
-        return (
-            '%.0f'
-            % value
-        )
+        return '%.0f' % value
 
-    return (
-        '%.1f'
-        % value
-    )
+    return '%.1f' % value
 
 
 # ============================================================================
-# DRAW SUMMARY
+# SUMMARY DISPLAY
 # ============================================================================
 
-def draw_summary(
-    window,
-    monitor
-):
+def draw_summary(window, monitor):
 
     system = monitor.system
 
-    files_total = (
-        system.files_total
-    )
-
-    files_free = (
-        system.files_free
-    )
+    files_total = system.files_total
+    files_free = system.files_free
 
     files_used = max(
         0.0,
         files_total - files_free
     )
 
-    files_percent = (
-        percent_used(
-            files_total,
-            files_free
-        )
+    files_percent = percent_used(
+        files_total,
+        files_free
     )
 
-    space_total = (
-        system.kbytes_total
-    )
-
-    space_free = (
-        system.kbytes_free
-    )
+    space_total = system.kbytes_total
+    space_free = system.kbytes_free
 
     space_used = max(
         0.0,
         space_total - space_free
     )
 
-    space_percent = (
-        percent_used(
-            space_total,
-            space_free
-        )
+    space_percent = percent_used(
+        space_total,
+        space_free
     )
 
     safe_addstr(
@@ -1284,12 +1046,9 @@ def draw_summary(
         1,
         0,
         (
-            'Files : '
-            '%.2fM used / '
-            '%.2fM total '
-            '(%.1f%%)'
-        )
-        % (
+            'Files : %.2fM used / '
+            '%.2fM total (%.1f%%)'
+        ) % (
             files_used / 1000000.0,
             files_total / 1000000.0,
             files_percent
@@ -1301,18 +1060,11 @@ def draw_summary(
         2,
         0,
         (
-            'Space : '
-            '%.2f TiB used / '
-            '%.2f TiB total '
-            '(%.1f%%)'
-        )
-        % (
-            kbytes_to_tib(
-                space_used
-            ),
-            kbytes_to_tib(
-                space_total
-            ),
+            'Space : %.2f TiB used / '
+            '%.2f TiB total (%.1f%%)'
+        ) % (
+            kbytes_to_tib(space_used),
+            kbytes_to_tib(space_total),
             space_percent
         )
     )
@@ -1325,8 +1077,7 @@ def draw_summary(
             'Read: %s    '
             'Write: %s    '
             'IOPS: %s'
-        )
-        % (
+        ) % (
             format_mib_rate(
                 system.read_bytes_per_sec
             ),
@@ -1339,25 +1090,19 @@ def draw_summary(
         )
     )
 
-    responding_oss = 0
+    oss_ok = 0
 
-    for metrics in (
-        monitor.ost_metrics.values()
-    ):
+    for metrics in monitor.ost_metrics.values():
 
         if metrics.success:
+            oss_ok += 1
 
-            responding_oss += 1
+    mds_ok = 0
 
-    responding_mds = 0
-
-    for metrics in (
-        monitor.mdt_metrics.values()
-    ):
+    for metrics in monitor.mdt_metrics.values():
 
         if metrics.success:
-
-            responding_mds += 1
+            mds_ok += 1
 
     safe_addstr(
         window,
@@ -1366,28 +1111,22 @@ def draw_summary(
         (
             'OSS: %d/%d responding    '
             'MDS: %d/%d responding'
-        )
-        % (
-            responding_oss,
+        ) % (
+            oss_ok,
             len(monitor.oss_hosts),
-            responding_mds,
+            mds_ok,
             len(monitor.mds_hosts)
         )
     )
 
 
 # ============================================================================
-# DRAW MDT SUMMARY
+# MDT DISPLAY
 # ============================================================================
 
-def draw_mdt_summary(
-    window,
-    monitor
-):
+def draw_mdt_summary(window, monitor):
 
-    rates = (
-        monitor.system.mdt_rates
-    )
+    rates = monitor.system.mdt_rates
 
     safe_addstr(
         window,
@@ -1420,7 +1159,7 @@ def draw_mdt_summary(
         ]
     ]
 
-    row_number = 7
+    row = 7
 
     for row_metrics in rows:
 
@@ -1428,47 +1167,39 @@ def draw_mdt_summary(
 
         for display_name, key in row_metrics:
 
-            value = (
-                rates.get(
-                    key,
-                    0.0
-                )
+            value = rates.get(
+                key,
+                0.0
             )
 
             text = (
                 '%s: %s/s'
                 % (
                     display_name,
-                    format_rate(
-                        value
-                    )
+                    format_rate(value)
                 )
             )
 
             safe_addstr(
                 window,
-                row_number,
+                row,
                 column,
                 text
             )
 
-            column += max(
-                18,
-                len(text) + 3
-            )
+            column += 20
 
-        row_number += 1
+        row += 1
 
 
 # ============================================================================
-# DRAW OSS TABLE
+# OSS DISPLAY
 # ============================================================================
 
 def draw_oss_table(
-    window,
-    monitor,
-    start_row
-):
+        window,
+        monitor,
+        start_row):
 
     safe_addstr(
         window,
@@ -1478,9 +1209,7 @@ def draw_oss_table(
         curses.A_BOLD
     )
 
-    header_row = (
-        start_row + 1
-    )
+    row = start_row + 1
 
     header = (
         '%-20s'
@@ -1497,25 +1226,20 @@ def draw_oss_table(
 
     safe_addstr(
         window,
-        header_row,
+        row,
         0,
         header
     )
 
-    row = (
-        header_row + 1
-    )
+    row += 1
 
     for host in monitor.oss_hosts:
 
-        metrics = (
-            monitor.ost_metrics.get(
-                host
-            )
+        metrics = monitor.ost_metrics.get(
+            host
         )
 
         if metrics is None:
-
             continue
 
         if metrics.success:
@@ -1552,10 +1276,7 @@ def draw_oss_table(
             error = metrics.error
 
             if len(error) > 20:
-
-                error = (
-                    error[:20]
-                )
+                error = error[:20]
 
             text = (
                 '%-20s'
@@ -1581,14 +1302,13 @@ def draw_oss_table(
 
 
 # ============================================================================
-# DRAW MDS TABLE
+# MDS DISPLAY
 # ============================================================================
 
 def draw_mds_table(
-    window,
-    monitor,
-    start_row
-):
+        window,
+        monitor,
+        start_row):
 
     safe_addstr(
         window,
@@ -1598,20 +1318,15 @@ def draw_mds_table(
         curses.A_BOLD
     )
 
-    row = (
-        start_row + 1
-    )
+    row = start_row + 1
 
     for host in monitor.mds_hosts:
 
-        metrics = (
-            monitor.mdt_metrics.get(
-                host
-            )
+        metrics = monitor.mdt_metrics.get(
+            host
         )
 
         if metrics is None:
-
             continue
 
         if metrics.success:
@@ -1640,9 +1355,9 @@ def draw_mds_table(
             text = (
                 '%-20s'
                 'OK    '
-                'open=%.1f/s  '
-                'close=%.1f/s  '
-                'getattr=%.1f/s'
+                'open=%10.1f/s  '
+                'close=%10.1f/s  '
+                'getattr=%10.1f/s'
                 % (
                     host,
                     open_rate,
@@ -1654,8 +1369,7 @@ def draw_mds_table(
         else:
 
             text = (
-                '%-20s'
-                'ERROR: %s'
+                '%-20sERROR: %s'
                 % (
                     host,
                     metrics.error
@@ -1673,19 +1387,14 @@ def draw_mds_table(
 
 
 # ============================================================================
-# DRAW FOOTER
+# FOOTER
 # ============================================================================
 
-def draw_footer(
-    window
-):
+def draw_footer(window):
 
-    height, width = (
-        window.getmaxyx()
-    )
+    height, width = window.getmaxyx()
 
     if height < 2:
-
         return
 
     safe_addstr(
@@ -1701,10 +1410,7 @@ def draw_footer(
 # DRAW COMPLETE SCREEN
 # ============================================================================
 
-def draw_screen(
-    window,
-    monitor
-):
+def draw_screen(window, monitor):
 
     window.erase()
 
@@ -1724,17 +1430,15 @@ def draw_screen(
         11
     )
 
-    mds_start = (
+    mds_row = (
         14 +
-        len(
-            monitor.ost_metrics
-        )
+        len(monitor.oss_hosts)
     )
 
     draw_mds_table(
         window,
         monitor,
-        mds_start
+        mds_row
     )
 
     draw_footer(
@@ -1745,31 +1449,23 @@ def draw_screen(
 
 
 # ============================================================================
-# CURSES MAIN
+# CURSES MAIN LOOP
 # ============================================================================
 
 def curses_main(
-    stdscr,
-    monitor
-):
+        stdscr,
+        monitor):
 
     try:
 
-        curses.curs_set(
-            0
-        )
+        curses.curs_set(0)
 
     except curses.error:
 
         pass
 
-    stdscr.nodelay(
-        True
-    )
-
-    stdscr.keypad(
-        True
-    )
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
 
     first_cycle = True
 
@@ -1777,9 +1473,9 @@ def curses_main(
 
         key = stdscr.getch()
 
-        # ====================================================================
+        # --------------------------------------------------------------------
         # Quit
-        # ====================================================================
+        # --------------------------------------------------------------------
 
         if key in (
             ord('q'),
@@ -1788,9 +1484,9 @@ def curses_main(
 
             break
 
-        # ====================================================================
+        # --------------------------------------------------------------------
         # Manual refresh
-        # ====================================================================
+        # --------------------------------------------------------------------
 
         force_refresh = (
             key in (
@@ -1799,15 +1495,14 @@ def curses_main(
             )
         )
 
-        should_collect = (
-            first_cycle
-        )
+        should_collect = first_cycle
 
         if not first_cycle:
 
             elapsed = (
-                time.monotonic()
-                - monitor.last_poll_time
+                monotonic()
+                -
+                monitor.last_poll_time
             )
 
             if elapsed >= monitor.interval:
@@ -1818,9 +1513,9 @@ def curses_main(
 
             should_collect = True
 
-        # ====================================================================
-        # Collect
-        # ====================================================================
+        # --------------------------------------------------------------------
+        # Collect data
+        # --------------------------------------------------------------------
 
         if should_collect:
 
@@ -1863,24 +1558,18 @@ def curses_main(
 
             first_cycle = False
 
-        time.sleep(
-            0.05
-        )
+        time.sleep(0.05)
 
 
 # ============================================================================
 # ONE-SHOT MODE
 # ============================================================================
 
-def print_once(
-    monitor
-):
+def print_once(monitor):
 
     monitor.collect()
 
-    system = (
-        monitor.system
-    )
+    system = monitor.system
 
     print
     print 'Lustre Storage System Status'
@@ -1899,10 +1588,8 @@ def print_once(
     )
 
     print (
-        'Files : '
-        '%.2fM used / '
-        '%.2fM total '
-        '(%.1f%%)'
+        'Files : %.2fM used / '
+        '%.2fM total (%.1f%%)'
     ) % (
         files_used / 1000000.0,
         system.files_total / 1000000.0,
@@ -1913,17 +1600,11 @@ def print_once(
     )
 
     print (
-        'Space : '
-        '%.2f TiB used / '
-        '%.2f TiB total '
-        '(%.1f%%)'
+        'Space : %.2f TiB used / '
+        '%.2f TiB total (%.1f%%)'
     ) % (
-        kbytes_to_tib(
-            space_used
-        ),
-        kbytes_to_tib(
-            system.kbytes_total
-        ),
+        kbytes_to_tib(space_used),
+        kbytes_to_tib(system.kbytes_total),
         percent_used(
             system.kbytes_total,
             system.kbytes_free
@@ -1951,24 +1632,17 @@ def print_once(
         )
     )
 
-    # ========================================================================
-    # OSS
-    # ========================================================================
-
     print
     print 'OSS'
     print '-' * 80
 
     for host in monitor.oss_hosts:
 
-        metrics = (
-            monitor.ost_metrics.get(
-                host
-            )
+        metrics = monitor.ost_metrics.get(
+            host
         )
 
         if metrics is None:
-
             continue
 
         if not metrics.success:
@@ -2007,24 +1681,17 @@ def print_once(
             write
         )
 
-    # ========================================================================
-    # MDS
-    # ========================================================================
-
     print
     print 'MDS / MDT'
     print '-' * 80
 
     for host in monitor.mds_hosts:
 
-        metrics = (
-            monitor.mdt_metrics.get(
-                host
-            )
+        metrics = monitor.mdt_metrics.get(
+            host
         )
 
         if metrics is None:
-
             continue
 
         if not metrics.success:
@@ -2076,7 +1743,7 @@ def print_once(
 
 
 # ============================================================================
-# ARGUMENT PARSER
+# COMMAND-LINE ARGUMENTS
 # ============================================================================
 
 def parse_arguments():
@@ -2150,37 +1817,21 @@ def main():
 
     args = parse_arguments()
 
-    # ========================================================================
-    # Hosts
-    # ========================================================================
-
     if args.oss_hosts:
 
-        oss_hosts = (
-            args.oss_hosts
-        )
+        oss_hosts = args.oss_hosts
 
     else:
 
-        oss_hosts = (
-            DEFAULT_OSS_HOSTS
-        )
+        oss_hosts = DEFAULT_OSS_HOSTS
 
     if args.mds_hosts:
 
-        mds_hosts = (
-            args.mds_hosts
-        )
+        mds_hosts = args.mds_hosts
 
     else:
 
-        mds_hosts = (
-            DEFAULT_MDS_HOSTS
-        )
-
-    # ========================================================================
-    # Validation
-    # ========================================================================
+        mds_hosts = DEFAULT_MDS_HOSTS
 
     if args.interval <= 0:
 
@@ -2209,20 +1860,16 @@ def main():
 
         return 1
 
-    # ========================================================================
-    # Create monitor
-    # ========================================================================
-
     monitor = LustreMonitor(
-        oss_hosts=oss_hosts,
-        mds_hosts=mds_hosts,
-        interval=args.interval,
-        ssh_timeout=args.ssh_timeout
+        oss_hosts,
+        mds_hosts,
+        args.interval,
+        args.ssh_timeout
     )
 
-    # ========================================================================
-    # One-shot
-    # ========================================================================
+    # ------------------------------------------------------------------------
+    # One-shot mode
+    # ------------------------------------------------------------------------
 
     if args.once:
 
@@ -2247,9 +1894,9 @@ def main():
 
         return 0
 
-    # ========================================================================
-    # Curses
-    # ========================================================================
+    # ------------------------------------------------------------------------
+    # Curses mode
+    # ------------------------------------------------------------------------
 
     try:
 
@@ -2275,7 +1922,7 @@ def main():
 
 
 # ============================================================================
-# START
+# ENTRY POINT
 # ============================================================================
 
 if __name__ == '__main__':
