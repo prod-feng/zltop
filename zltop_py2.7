@@ -30,7 +30,20 @@ Examples:
         --oss ookami04 \
         --mds ookami02 \
         --once
+python2.7 lustre_monitor.py \
+    --config lustre_monitor.conf
 
+The config file has the format of:
+DEFAULT_OSS_HOSTS = [
+    'ookami04',
+    'ookami05',
+    'ookami06',
+    'ookami07',
+]
+DEFAULT_MDS_HOSTS = [
+    'ookami02',
+    'ookami03'
+]
 
 This program collects Lustre performance information using:
 
@@ -93,6 +106,7 @@ crossdir_rename           2844890 samples [reqs]
 """
 
 import argparse
+import ast
 import curses
 import re
 import subprocess
@@ -247,6 +261,122 @@ class CollectionResult(object):
 # ============================================================================
 # GENERAL UTILITIES
 # ============================================================================
+
+# ============================================================================
+# CONFIG FILE
+# ============================================================================
+
+def load_config_file(filename):
+
+    oss_hosts = None
+    mds_hosts = None
+
+    try:
+
+        with open(filename, 'r') as config_file:
+
+            tree = ast.parse(
+                config_file.read(),
+                filename
+            )
+
+    except IOError as exc:
+
+        raise RuntimeError(
+            'cannot read config file %s: %s'
+            % (
+                filename,
+                str(exc)
+            )
+        )
+
+    except SyntaxError as exc:
+
+        raise RuntimeError(
+            'invalid config file %s: %s'
+            % (
+                filename,
+                str(exc)
+            )
+        )
+
+    for node in tree.body:
+
+        if not isinstance(
+                node,
+                ast.Assign):
+
+            continue
+
+        for target in node.targets:
+
+            if not isinstance(
+                    target,
+                    ast.Name):
+
+                continue
+
+            if target.id == 'DEFAULT_OSS_HOSTS':
+
+                try:
+
+                    value = ast.literal_eval(
+                        node.value
+                    )
+
+                except Exception:
+
+                    raise RuntimeError(
+                        'invalid DEFAULT_OSS_HOSTS '
+                        'in config file %s'
+                        % filename
+                    )
+
+                if not isinstance(
+                        value,
+                        list):
+
+                    raise RuntimeError(
+                        'DEFAULT_OSS_HOSTS must be '
+                        'a list in config file %s'
+                        % filename
+                    )
+
+                oss_hosts = value
+
+            elif target.id == 'DEFAULT_MDS_HOSTS':
+
+                try:
+
+                    value = ast.literal_eval(
+                        node.value
+                    )
+
+                except Exception:
+
+                    raise RuntimeError(
+                        'invalid DEFAULT_MDS_HOSTS '
+                        'in config file %s'
+                        % filename
+                    )
+
+                if not isinstance(
+                        value,
+                        list):
+
+                    raise RuntimeError(
+                        'DEFAULT_MDS_HOSTS must be '
+                        'a list in config file %s'
+                        % filename
+                    )
+
+                mds_hosts = value
+
+    return (
+        oss_hosts,
+        mds_hosts
+    )
+
 
 def safe_float(value, default=0.0):
 
@@ -2951,6 +3081,16 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        '--config',
+        dest='config_file',
+        help=(
+            'Configuration file containing '
+            'DEFAULT_OSS_HOSTS and '
+            'DEFAULT_MDS_HOSTS.'
+        )
+    )
+
+    parser.add_argument(
         '--oss',
         action='append',
         dest='oss_hosts',
@@ -3009,6 +3149,27 @@ def parse_arguments():
 def main():
 
     args = parse_arguments()
+
+    if args.config_file:
+
+        try:
+
+            (
+                config_oss_hosts,
+                config_mds_hosts
+            ) = load_config_file(
+                args.config_file
+            )
+
+        except RuntimeError as exc:
+
+            print >> sys.stderr, (
+                'ERROR: %s'
+                % str(exc)
+            )
+
+            return 1
+
 
     if args.oss_hosts:
 
