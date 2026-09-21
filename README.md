@@ -96,6 +96,22 @@ Command examples:
         --mds ookami02 \
         --once
 
+python2.7 lustre_monitor.py \
+    --config lustre_monitor.conf
+
+Config file format:
+
+DEFAULT_OSS_HOSTS = [
+    'ookami04',
+    'ookami05',
+    'ookami06',
+    'ookami07',
+]
+
+DEFAULT_MDS_HOSTS = [
+    'ookami02',
+    'ookami03'
+]
 ```
 
 
