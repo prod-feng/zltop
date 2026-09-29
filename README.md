@@ -116,3 +116,15 @@ DEFAULT_MDS_HOSTS = [
 
 
 <img width="894" height="897" alt="Screenshot 2026-09-20 at 5 33 14 PM" src="https://github.com/user-attachments/assets/53addf6f-9302-408e-a14c-351a50965d71" />
+
+
+# lustre_client_mon.py
+
+A 'top" like command to monitor Lustre client nodes' IO performance.
+
+User "scontrol show node" to get all client nodes names.
+<img width="1052" height="163" alt="Screenshot 2026-09-28 at 10 52 58 PM" src="https://github.com/user-attachments/assets/e9c75da3-8135-4cc9-885c-3f113569acc0" />
+
+
+
+
